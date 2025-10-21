@@ -20,10 +20,7 @@ except Exception:
     pass 
 
 #오픈AI API 키 설정
-os.environ["OPENAI_API_KEY"] = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
-if not os.environ["OPENAI_API_KEY"]:
-    st.error("OPENAI_API_KEY가 없습니다. secrets.toml 또는 환경변수를 확인하세요.")
-    st.stop()
+os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 
 #cache_resource로 한번 실행한 결과 캐싱해두기
 @st.cache_resource
