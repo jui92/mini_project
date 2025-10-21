@@ -1,25 +1,18 @@
 import os, io, time, contextlib, tempfile, hashlib
 import requests
 from bs4 import BeautifulSoup
-
 import streamlit as st
 
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-
 from langchain_openai import ChatOpenAI
 # (로컬 LLM 쓰면) from langchain_ollama import ChatOllama
-
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # --- OpenAI 키 로딩 ---
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    st.error("OPENAI_API_KEY가 없습니다. .streamlit/secrets.toml 또는 환경변수를 설정하세요.")
-    st.stop()
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 
 # --- LLM 선택 (둘 중 택1) ---
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)     # 클라우드
