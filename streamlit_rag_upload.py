@@ -1,5 +1,4 @@
-import os
-import tempfile
+import os, hashlib, tempfile
 import streamlit as st
 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -7,19 +6,24 @@ from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-from langchain.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 #Chroma tenant 오류 방지 위한 코드
 import chromadb
 chromadb.api.client.SharedSystemClient.clear_system_cache()
 
-import sys
-__import__("pysqlite3")
-sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+try:
+    import sys
+    __import__("pysqlite3"); sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except Exception:
+    pass 
 
 #오픈AI API 키 설정
-os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+os.environ["OPENAI_API_KEY"] = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+if not os.environ["OPENAI_API_KEY"]:
+    st.error("OPENAI_API_KEY가 없습니다. secrets.toml 또는 환경변수를 확인하세요.")
+    st.stop()
 
 #cache_resource로 한번 실행한 결과 캐싱해두기
 @st.cache_resource
