@@ -680,7 +680,6 @@ if st.button("새 질문 받기", use_container_width=True):
 아래 '포커스' 중 최소 1개 키워드를 문장에 **명시적으로 포함**하고, 지표/수치/기간/규모/리스크 요소를 적절히 섞어라.
 포맷: 1) ... 2) ... 3) ... ... (한 줄씩)"""
         user = f"""[회사/직무 컨텍스트]\n{ctx}\n[포커스]\n- {chr(10).join(focuses)}{rag_note}\n[랜덤시드] {seed}"""
-        resp = client.chat_completions.create  # guard for IDE hints
         resp = client.chat.completions.create(model=MODEL, temperature=0.95,
                                               messages=[{"role":"system","content":sys},{"role":"user","content":user}])
         raw = resp.choices[0].message.content.strip()
