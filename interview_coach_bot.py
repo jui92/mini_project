@@ -269,52 +269,175 @@ def _find_section_bullets(soup: BeautifulSoup, keys: list[str]) -> list[str]:
         return _split_bullets(body_text)
     return []
 
+# --- 추가: 동적 페이지 텍스트 스냅샷 (Jina Reader) ---
+def fetch_text_snapshot(url: str, timeout: int = 12) -> str:
+    """r.jina.ai를 이용해 렌더된 페이지의 순수 텍스트를 가져온다."""
+    try:
+        snap_url = "https://r.jina.ai/http/" + url.lstrip("http://").lstrip("https://")
+        r = requests.get(snap_url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code == 200 and r.text:
+            # 너무 긴 경우 경량화
+            return re.sub(r"\s+", " ", r.text).strip()
+    except Exception:
+        pass
+    return ""
+
+# --- 교체: parse_job_posting (강화판) ---
 def parse_job_posting(url: str) -> dict:
+    """
+    반환: title, responsibilities(원문 리스트), qualifications(원문 리스트), preferred(원문 리스트), company_intro
+    1) HTML/JSON-LD
+    2) 사이트별 셀렉터 (Wanted/Saramin/JobKorea/Rocketpunch)
+    3) Jina Reader 스냅샷 → 섹션 키워드 분리
+    """
     out = {"title": None, "responsibilities": [], "qualifications": [], "preferred": [], "company_intro": None}
     try:
         r = requests.get(url, timeout=12, headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code != 200 or "text/html" not in r.headers.get("content-type",""): return out
-        soup = BeautifulSoup(r.text, "html.parser")
-        # json-ld
-        jp = _extract_json_ld_job(soup)
-        if jp:
-            out["title"]=jp.get("title")
-            desc=_clean_text(jp.get("description",""))
-            if desc:
-                b=_split_bullets(desc)
-                for line in b:
-                    low=line.lower()
-                    if any(k.lower() in low for k in PREF_KEYS): out["preferred"].append(line)
-                    elif any(k.lower() in low for k in QUAL_KEYS): out["qualifications"].append(line)
-                    else: out["responsibilities"].append(line)
+        if r.status_code == 200 and "text/html" in r.headers.get("content-type",""):
+            soup = BeautifulSoup(r.text, "html.parser")
 
-        # header/section
-        if not out["responsibilities"]:
-            out["responsibilities"]=_find_section_bullets(soup, RESP_KEYS)
-        if not out["qualifications"]:
-            out["qualifications"]=_find_section_bullets(soup, QUAL_KEYS)
-        if not out["preferred"]:
-            out["preferred"]=_find_section_bullets(soup, PREF_KEYS)
+            # 0) 메타 제목/설명
+            if soup.title and soup.title.string:
+                out["title"] = _clean_text(soup.title.string)
+            meta_desc = soup.find("meta", {"name":"description"}) or soup.find("meta", {"property":"og:description"})
+            if meta_desc and meta_desc.get("content"):
+                out["company_intro"] = _snippetize(meta_desc["content"], 220)
 
-        # <li> 폴백: 분류 키워드로 라벨링
-        if not (out["responsibilities"] or out["qualifications"] or out["preferred"]):
-            lis=[_clean_text(li.get_text(" ")) for li in soup.find_all("li")]
-            for t in lis:
-                low=t.lower()
-                if any(k.lower() in low for k in PREF_KEYS): out["preferred"].append(t)
-                elif any(k.lower() in low for k in QUAL_KEYS): out["qualifications"].append(t)
-                else: out["responsibilities"].append(t)
+            # 1) JSON-LD
+            jp = _extract_json_ld_job(soup)
+            if jp:
+                out["title"] = jp.get("title") or out["title"]
+                desc = _clean_text(jp.get("description",""))
+                if desc:
+                    for line in _split_bullets(desc):
+                        low = line.lower()
+                        if any(k.lower() in low for k in PREF_KEYS): out["preferred"].append(line)
+                        elif any(k.lower() in low for k in QUAL_KEYS): out["qualifications"].append(line)
+                        else: out["responsibilities"].append(line)
 
-        meta = soup.find("meta", {"name":"description"}) or soup.find("meta", {"property":"og:description"})
-        if meta and meta.get("content"): out["company_intro"]=_snippetize(meta["content"], 220)
+            # 2) 사이트별 전용 처리 ------------------------------------
+            host = (_domain(url) or "")
+            html_got_any = bool(out["responsibilities"] or out["qualifications"] or out["preferred"])
 
-        # 원문 유지, 길이만 클램프
-        out["responsibilities"]=[_snippetize(x,200) for x in out["responsibilities"]][:20]
-        out["qualifications"]  =[_snippetize(x,200) for x in out["qualifications"]][:20]
-        out["preferred"]       =[_snippetize(x,200) for x in out["preferred"]][:20]
+            # Wanted (next.js) — __NEXT_DATA__에서 본문
+            if ("wanted.co.kr" in host or "kr.wanted" in host) and not html_got_any:
+                nd = soup.find("script", id="__NEXT_DATA__")
+                if nd and nd.string:
+                    try:
+                        data = json.loads(nd.string)
+                        # 경로가 수시로 바뀌지만, 보통 props.pageProps.jobDetail 혹은 job.data.description 등에 위치
+                        text_fields = []
+                        def walk(x):
+                            if isinstance(x, dict):
+                                for k,v in x.items():
+                                    if isinstance(v, (dict,list)):
+                                        walk(v)
+                                    else:
+                                        if isinstance(v, str) and len(v) > 20:
+                                            if any(tk in k.lower() for tk in ["description","requirement","qualification","preference","responsibil"]):
+                                                text_fields.append(v)
+                            elif isinstance(x, list):
+                                for it in x: walk(it)
+                        walk(data)
+                        big_text = "\n".join(text_fields)
+                        for line in _split_bullets(big_text):
+                            low = line.lower()
+                            if any(k.lower() in low for k in PREF_KEYS): out["preferred"].append(line)
+                            elif any(k.lower() in low for k in QUAL_KEYS): out["qualifications"].append(line)
+                            else: out["responsibilities"].append(line)
+                        html_got_any = bool(out["responsibilities"] or out["qualifications"] or out["preferred"])
+                    except Exception:
+                        pass
+
+            # Saramin
+            if "saramin.co.kr" in host and not html_got_any:
+                body = soup.select_one("#job_summary, .user_content, .wrap_jview")
+                if body:
+                    txt = body.get_text("\n")
+                    for line in _split_bullets(txt):
+                        low=line.lower()
+                        if any(k.lower() in low for k in PREF_KEYS): out["preferred"].append(line)
+                        elif any(k.lower() in low for k in QUAL_KEYS): out["qualifications"].append(line)
+                        else: out["responsibilities"].append(line)
+                    html_got_any = bool(out["responsibilities"] or out["qualifications"] or out["preferred"])
+
+            # JobKorea
+            if "jobkorea.co.kr" in host and not html_got_any:
+                body = soup.select_one("#tab02, .detailArea, .recruitMent, .smartApply")
+                if body:
+                    txt = body.get_text("\n")
+                    for line in _split_bullets(txt):
+                        low=line.lower()
+                        if any(k.lower() in low for k in PREF_KEYS): out["preferred"].append(line)
+                        elif any(k.lower() in low for k in QUAL_KEYS): out["qualifications"].append(line)
+                        else: out["responsibilities"].append(line)
+                    html_got_any = bool(out["responsibilities"] or out["qualifications"] or out["preferred"])
+
+            # Rocketpunch
+            if "rocketpunch.com" in host and not html_got_any:
+                body = soup.select_one(".job-detail, .description, .job-detail__full")
+                if body:
+                    txt = body.get_text("\n")
+                    for line in _split_bullets(txt):
+                        low=line.lower()
+                        if any(k.lower() in low for k in PREF_KEYS): out["preferred"].append(line)
+                        elif any(k.lower() in low for k in QUAL_KEYS): out["qualifications"].append(line)
+                        else: out["responsibilities"].append(line)
+                    html_got_any = bool(out["responsibilities"] or out["qualifications"] or out["preferred"])
+
+            # 3) 공통 헤더 섹션 + <li> 폴백 (기존 로직)
+            if not html_got_any:
+                if not out["responsibilities"]:
+                    out["responsibilities"] = _find_section_bullets(soup, RESP_KEYS)
+                if not out["qualifications"]:
+                    out["qualifications"] = _find_section_bullets(soup, QUAL_KEYS)
+                if not out["preferred"]:
+                    out["preferred"] = _find_section_bullets(soup, PREF_KEYS)
+
+                if not (out["responsibilities"] or out["qualifications"] or out["preferred"]):
+                    lis=[_clean_text(li.get_text(" ")) for li in soup.find_all("li")]
+                    for t in lis:
+                        low=t.lower()
+                        if any(k.lower() in low for k in PREF_KEYS): out["preferred"].append(t)
+                        elif any(k.lower() in low for k in QUAL_KEYS): out["qualifications"].append(t)
+                        else: out["responsibilities"].append(t)
+                html_got_any = bool(out["responsibilities"] or out["qualifications"] or out["preferred"])
+
+            # 4) 최종 폴백: Jina Reader 스냅샷으로 섹션 분리 ----------------
+            if not html_got_any:
+                snap = fetch_text_snapshot(url)
+                if snap:
+                    # 한국어/영문 섹션 라벨 키워드
+                    resp = re.split(r"(?:주요\s*업무|담당\s*업무|Responsibilities?|What you will do|Role)\s*[:\-]?", snap, flags=re.I)
+                    qual = re.split(r"(?:자격\s*요건|지원\s*자격|Requirements?|Qualifications?)\s*[:\-]?", snap, flags=re.I)
+                    pref = re.split(r"(?:우대\s*사항?|Preferred|Nice to have)\s*[:\-]?", snap, flags=re.I)
+
+                    def pick(arr):
+                        # 가장 긴 분절을 선택 후 불릿 분리
+                        if not arr: return []
+                        cand = max(arr, key=len)
+                        return _split_bullets(cand)[:30]
+
+                    if not out["responsibilities"]: out["responsibilities"] = pick(resp)
+                    if not out["qualifications"]:   out["qualifications"] = pick(qual)
+                    if not out["preferred"]:        out["preferred"] = pick(pref)
+
+        # 길이 클램프/중복 제거
+        def dedup(lst):
+            s=set(); o=[]
+            for x in lst:
+                if x and x not in s:
+                    s.add(x); o.append(_snippetize(x, 200))
+            return o[:25]
+        out["responsibilities"] = dedup(out["responsibilities"])
+        out["qualifications"]   = dedup(out["qualifications"])
+        out["preferred"]        = dedup(out["preferred"])
+
     except Exception:
         pass
+
     return out
+
 
 # ---------- openai ----------
 with st.sidebar:
