@@ -515,7 +515,7 @@ with left:
     st.markdown("**회사 요약**")
     st.json(company, expanded=False)
 
-    prompt_hint = st.text_input("질문 생성 힌트(선택)", placeholder="예: 구독 전환 퍼널 관련 경험 위주로")
+    prompt_hint = st.text_input("질문 생성 힌트(선택)", placeholder="예: 프로젝트 관련 경험 위주로")
     if st.button("새 질문 받기", use_container_width=True):
         try:
             supports = []
