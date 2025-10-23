@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 # ==========================================================
-# 회사 특화 가상 면접 코치 (텍스트 전용 / RAG + 레이더 + CSV)
-# - 직무 선택 & 채용공고 자동 수집(권장: URL 입력, 없으면 검색 시도)
-# - 회사 뉴스/최근 이슈 반영 (Google News RSS)
-# - 질문 다양성 강화: 후보 N개 생성 + 반중복 선택 + 무작위 포커스
-# - 채용공고 기준 요약(회사/간단 소개/모집분야/주요 업무/자격 요건)
-# - Streamlit Cloud 호환, Plotly/FAISS 선택적, 시크릿 안전 로더
+# 회사 특화 가상 면접 코치 (한국 취업 최적화, 후보선택 제거/요약 강화)
+# - ① 회사/직무 입력(통합) → ② 회사 요약(LLM 생성) → ③ 질문 생성 → ④ 답변/코칭
+# - 홈페이지/공고 URL이 있으면 **크롤링 우선**, 없으면 **국내 포털(네이버 검색) 폴백**
+# - 회사 요약: 모델로 재작성 요약
+# - 채점: 100점제(항목별 20점 × 5)
 # ==========================================================
 
 import os, io, re, json, textwrap, urllib.parse, difflib, random, time
@@ -35,14 +34,6 @@ except ImportError:
 
 import requests
 from bs4 import BeautifulSoup
-try:
-    import wikipedia
-    try:
-        wikipedia.set_lang("ko")
-    except Exception:
-        pass
-except Exception:
-    wikipedia = None
 
 # ---------- Page config ----------
 st.set_page_config(page_title="회사 특화 가상 면접 코치", page_icon="🎯", layout="wide")
@@ -117,7 +108,7 @@ def read_file_to_text(uploaded) -> str:
             return ""
     return ""
 
-# ---------- Company/domain utils ----------
+# ---------- Domain / helpers ----------
 VAL_KEYWORDS = ["핵심가치","가치","미션","비전","문화","원칙","철학","고객","데이터","혁신",
                 "values","mission","vision","culture","principles","philosophy","customer","data","innovation"]
 
@@ -132,25 +123,7 @@ def _domain(u: str|None) -> str|None:
 def _name_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-# ---------- Wikipedia helpers (후보 노출/선택) ----------
-def wiki_search_candidates(company_name: str, k: int = 8) -> list[str]:
-    if wikipedia is None or not company_name.strip():
-        return []
-    try:
-        return wikipedia.search(company_name.strip(), results=k) or []
-    except Exception:
-        return []
-
-def fetch_wikipedia_summary_exact(title: str) -> dict|None:
-    if wikipedia is None or not title: return None
-    try:
-        page = wikipedia.page(title, auto_suggest=False, redirect=True)
-        first = _clean_text((page.summary or "").split("\n")[0])
-        return {"company_name": page.title, "wiki_summary": first}
-    except Exception:
-        return None
-
-# ---------- 네이버 Open API 래퍼 ----------
+# ---------- NAVER Open API ----------
 def _naver_api_get(api: str, params: dict, cid: str, csec: str):
     url = f"https://openapi.naver.com/v1/search/{api}.json"
     headers = {
@@ -188,7 +161,7 @@ def naver_search_web(query: str, display: int = 10, sort: str = "date") -> list[
             links.append(link)
     return links
 
-# ---------- 홈페이지 스니펫 ----------
+# ---------- 사이트 크롤링 (About/Values 추정) ----------
 def fetch_site_snippets(base_url: str | None, company_name_hint: str | None = None) -> dict:
     if not base_url:
         return {"values": [], "recent": [], "site_name": None, "about": None}
@@ -246,12 +219,41 @@ def fetch_site_snippets(base_url: str | None, company_name_hint: str | None = No
 
     return {"values": trimmed[:6], "recent": recent_found, "site_name": site_name, "about": about_para}
 
+# ---------- 홈페이지에서 커리어/채용 링크 자동 탐색 ----------
+CAREER_HINTS = ["careers", "career", "jobs", "job", "recruit", "recruiting", "join", "hire", "hiring",
+                "채용", "인재", "입사지원", "채용공고", "인재영입", "사람", "커리어"]
+
+def discover_job_from_homepage(homepage: str, limit: int = 5) -> list[str]:
+    if not homepage: return []
+    try:
+        if not homepage.startswith("http"): homepage = "https://" + homepage
+        r = requests.get(homepage, timeout=8, headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code != 200 or "text/html" not in r.headers.get("content-type",""):
+            return []
+        soup = BeautifulSoup(r.text, "htmlparser") if False else BeautifulSoup(r.text, "html.parser")
+        links=[]
+        for path in ["careers","recruit","jobs","career","채용","인재영입","recruitment","join"]:
+            links.append(urllib.parse.urljoin(homepage.rstrip("/") + "/", path))
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            text = (a.get_text() or "").lower()
+            if any(k in href.lower() or k in text for k in CAREER_HINTS):
+                links.append(urllib.parse.urljoin(homepage, href))
+        out=[]; seen=set()
+        for lk in links:
+            d = _domain(lk)
+            if lk not in seen and d:
+                seen.add(lk); out.append(lk)
+                if len(out) >= limit: break
+        return out[:limit]
+    except Exception:
+        return []
+
 # ---------- 뉴스: 네이버 우선, 폴백 구글RSS ----------
 def fetch_news(company_name: str, max_items: int = 6) -> list[dict]:
     news = naver_search_news(company_name, display=max_items, sort="date")
     if news:
         return news
-    # fallback: Google News RSS
     q = urllib.parse.quote(company_name)
     url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
     items = []
@@ -268,17 +270,21 @@ def fetch_news(company_name: str, max_items: int = 6) -> list[dict]:
         return []
     return items
 
-# ---------- 채용 공고: 네이버 웹검색 우선, 폴백 DuckDuckGo ----------
+# ---------- 채용 공고: 홈페이지 우선 → 네이버 포털 → DuckDuckGo ----------
 SEARCH_ENGINES = ["https://duckduckgo.com/html/?q={query}"]
 JOB_SITES = ["wanted.co.kr","saramin.co.kr","jobkorea.co.kr","rocketpunch.com",
              "indeed.com","linkedin.com","recruit.navercorp.com","kakao.recruit","naver"]
 
-def discover_job_posting_urls(company_name: str, role: str, limit: int = 5) -> list[str]:
+def discover_job_posting_urls(company_name: str, role: str, homepage: str|None, limit: int = 5) -> list[str]:
     urls = []
+    urls += discover_job_from_homepage(homepage, limit=limit) if homepage else []
+    if urls:
+        return urls[:limit]
+
     if NAVER_ID and NAVER_SECRET:
         for dom in JOB_SITES:
             if len(urls) >= limit: break
-            q = f"{company_name} {role} site:{dom}"
+            q = f"{company_name} {role} site:{dom}" if role else f"{company_name} 채용 site:{dom}"
             links = naver_search_web(q, display=5, sort="date")
             for lk in links:
                 if _domain(lk) and dom in _domain(lk) and lk not in urls:
@@ -286,9 +292,9 @@ def discover_job_posting_urls(company_name: str, role: str, limit: int = 5) -> l
                 if len(urls) >= limit: break
         if urls:
             return urls[:limit]
-    # fallback: DuckDuckGo
+
     site_part = " OR ".join([f'site:{d}' for d in JOB_SITES])
-    q = f'{company_name} {role} ({site_part})'
+    q = f'{company_name} {role} ({site_part})' if role else f'{company_name} 채용 ({site_part})'
     for engine in SEARCH_ENGINES:
         url = engine.format(query=urllib.parse.quote(q))
         try:
@@ -328,7 +334,7 @@ def _extract_json_ld_job(soup: BeautifulSoup) -> Optional[dict]:
 def parse_job_posting(url: str) -> dict:
     out = {"title": None, "responsibilities": [], "qualifications": [], "company_intro": None}
     try:
-        r = requests.get(url, timeout=10, headers={"User-Agent":"Mozilla/5.0"})
+        r = requests.get(url, timeout=12, headers={"User-Agent":"Mozilla/5.0"})
         if r.status_code != 200 or "text/html" not in r.headers.get("content-type",""): return out
         soup = BeautifulSoup(r.text, "html.parser")
 
@@ -345,7 +351,6 @@ def parse_job_posting(url: str) -> dict:
                     else:
                         out["responsibilities"].append(b)
 
-        # 헤더 휴리스틱
         sections = {}
         for h in soup.find_all(re.compile("^h[1-4]$")):
             head = _clean_text(h.get_text())
@@ -413,112 +418,129 @@ except Exception as e:
     st.error(f"OpenAI 초기화 오류: {e}"); st.stop()
 
 # ==========================================================
-# MAIN LAYOUT — ① 회사 입력 | ② 직무 입력  → ③ 요약 → ④ 질문 → ⑤ 답변
+# ① 회사/직무 입력 (통합)
 # ==========================================================
-col_company, col_role = st.columns([1, 1])
+st.subheader("① 회사/직무 입력")
+company_name_input = st.text_input("회사 이름 (그대로 사용)", placeholder="예: 네이버 / Kakao / 삼성SDS")
+homepage_input     = st.text_input("공식 홈페이지 URL(선택)", placeholder="https://...")
+role_title         = st.text_input("지원 직무명", placeholder="데이터 애널리스트 / ML 엔지니어 ...")
+job_url_input      = st.text_input("채용 공고 URL(선택) — 없다면 자동 탐색")
 
-# ① 회사 입력 ------------------------------------------------
-with col_company:
-    st.subheader("① 회사 입력")
-    company_name_input = st.text_input("회사 이름", placeholder="예: 네이버 / Kakao / 삼성SDS")
-    homepage_input     = st.text_input("공식 홈페이지 URL(선택)", placeholder="https://...")
-    job_url_input      = st.text_input("채용 공고 URL(선택)")
+if "company_state" not in st.session_state:
+    st.session_state.company_state = {}
+if "answer_text" not in st.session_state:
+    st.session_state.answer_text = ""   # 사용자가 쓰는 답변 상태
 
-    # 회사 후보 검색(오인식 방지)
-    if company_name_input.strip():
-        cands = wiki_search_candidates(company_name_input, k=8)
-        cands = ["(입력 그대로 사용)"] + cands
-        chosen = st.selectbox("회사 후보(정확한 이름 선택)", options=cands, index=0, help="위키 후보에서 정확한 회사를 선택하면 오인식이 크게 줄어듭니다.")
+def build_company_obj(name: str, homepage: str|None, role: str|None, job_url: str|None) -> dict:
+    site = fetch_site_snippets(homepage or None, name)
+    jp_data = {"title": None,"responsibilities":[],"qualifications":[],"company_intro":None}
+    discovered = []
+    if job_url:
+        discovered = [job_url]
     else:
-        chosen = "(입력 그대로 사용)"
+        discovered = discover_job_posting_urls(name, role or "", homepage, limit=4)
+    if discovered:
+        jp_data = parse_job_posting(discovered[0])
+    news_items = fetch_news(name, max_items=6)
+    return {
+        "company_name": name.strip() or "(회사명 미설정)",
+        "homepage": homepage or None,
+        "values": site.get("values", []),
+        "recent_projects": site.get("recent", []),
+        "company_intro_site": site.get("about"),
+        "role": role or "",
+        "role_requirements": jp_data["responsibilities"],
+        "role_qualifications": jp_data["qualifications"],
+        "job_url": discovered[0] if discovered else (job_url or None),
+        "news": news_items
+    }
 
-    if "company_state" not in st.session_state:
-        st.session_state.company_state = {}
+def generate_company_summary(c: dict) -> str:
+    ctx_src = textwrap.dedent(f"""
+    [원자료]
+    - 홈페이지 요약후보: {c.get('company_intro_site') or ''}
+    - 핵심가치/문화: {', '.join(c.get('values', [])[:6])}
+    - 최근 프로젝트/문장: {', '.join(c.get('recent_projects', [])[:4])}
+    - 모집 분야: {c.get('role','')}
+    - 주요 업무: {', '.join(c.get('role_requirements', [])[:8])}
+    - 자격 요건: {', '.join(c.get('role_qualifications', [])[:8])}
+    - 최신 뉴스 타이틀: {', '.join([_snippetize(n['title'],70) for n in c.get('news', [])[:4]])}
+    """).strip()
 
-    if st.button("회사 정보 불러오기"):
-        # 위키 고정
-        wiki = None
-        if chosen != "(입력 그대로 사용)":
-            wiki = fetch_wikipedia_summary_exact(chosen)
-        elif company_name_input.strip():
-            wiki = {"company_name": company_name_input.strip(), "wiki_summary": None}
+    sys = ("너는 채용담당자다. 아래 원자료를 바탕으로 채용공고 기준의 회사 요약을 한국어로 깔끔히 작성하라. "
+           "텍스트를 그대로 복사하지 말고 자연어로 재작성하며, 불필요한 수식어/광고성 문구는 제거한다. "
+           "출력 포맷은 다음 섹션을 굵은 제목과 함께 제공한다: "
+           "1) 회사명, 2) 간단한 회사 소개(2~3문장), 3) 모집 분야(1줄), 4) 주요 업무(불릿 3~5개), 5) 자격 요건(불릿 3~5개).")
+    user = f"{ctx_src}\n\n[회사명] {c.get('company_name','')}"
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL, temperature=0.3,
+            messages=[{"role":"system","content":sys},{"role":"user","content":user}]
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        intro = c.get("company_intro_site") or "회사 소개 정보가 충분하지 않습니다."
+        reqs = c.get("role_requirements", [])[:5] or ["주요 업무 정보 부족"]
+        quals = c.get("role_qualifications", [])[:5] or ["자격 요건 정보 부족"]
+        md = f"""**회사명**  
+{c.get('company_name')}
 
-        # 사이트 크롤링
-        site = fetch_site_snippets(homepage_input or None, (wiki or {}).get("company_name") or company_name_input)
+**간단한 회사 소개**  
+{intro}
 
-        # 뉴스 (네이버 우선)
-        news_items = fetch_news((wiki or {}).get("company_name") or company_name_input)
+**모집 분야**  
+{c.get('role') or 'N/A'}
 
-        st.session_state.company_state["base"] = {
-            "company_name": site.get("site_name") or (wiki or {}).get("company_name") or company_name_input.strip(),
-            "wiki_summary": (wiki or {}).get("wiki_summary"),
-            "homepage": homepage_input or None,
-            "values": site.get("values", []),
-            "recent_projects": site.get("recent", []),
-            "company_intro": site.get("about") or (wiki or {}).get("wiki_summary"),
-            "news": news_items
-        }
+**주요 업무**  
+- {"\n- ".join(reqs)}
+
+**자격 요건**  
+- {"\n- ".join(quals)}
+"""
+        return md
+
+# 빨간색(Primary) 버튼
+if st.button("회사/직무 정보 불러오기", type="primary"):
+    if not company_name_input.strip():
+        st.warning("회사 이름을 입력해 주세요.")
+    else:
+        with st.spinner("회사/직무/공고/뉴스를 수집 중..."):
+            cobj = build_company_obj(company_name_input, homepage_input or None, role_title or None, job_url_input or None)
+            summary_md = generate_company_summary(cobj)
+            st.session_state.company_state["company"] = cobj
+            st.session_state.company_state["summary_md"] = summary_md
         st.success("회사 정보 갱신 완료")
 
-# ② 직무 입력 ------------------------------------------------
-with col_role:
-    st.subheader("② 직무 입력")
-    role_title = st.text_input("지원 직무명", placeholder="데이터 애널리스트 / ML 엔지니어 ...")
-    st.caption("채용 공고 URL을 모르면 ‘회사/직무명’으로 네이버 웹검색을 통해 자동 탐색합니다.")
-    if st.button("채용 공고 불러오기/검색"):
-        jp_data = {"title": None,"responsibilities":[],"qualifications":[],"company_intro":None}
-        urls = []
-        if job_url_input.strip():
-            urls = [job_url_input.strip()]
-        else:
-            urls = discover_job_posting_urls(st.session_state.company_state.get("base",{}).get("company_name","") or role_title,
-                                             role_title or "", limit=4)
-        if urls:
-            jp_data = parse_job_posting(urls[0])
-        st.session_state.company_state["job"] = {
-            "role": role_title,
-            "job_url": urls[0] if urls else (job_url_input.strip() or None),
-            "role_requirements": jp_data["responsibilities"],
-            "role_qualifications": jp_data["qualifications"],
-            "company_intro": jp_data["company_intro"] or st.session_state.company_state.get("base",{}).get("company_intro")
-        }
-        st.success("채용 공고 반영 완료")
+company = st.session_state.get("company_state",{}).get("company", {
+    "company_name": "(회사명 미설정)", "homepage": None, "values": [], "recent_projects": [],
+    "company_intro_site": None, "role": "", "role_requirements": [], "role_qualifications": [],
+    "job_url": None, "news": []
+})
+summary_md = st.session_state.get("company_state",{}).get("summary_md", None)
 
-# company 객체 조립 ------------------------------------------
-base = st.session_state.get("company_state",{}).get("base",{})
-job  = st.session_state.get("company_state",{}).get("job",{})
-company = {
-    "company_name": base.get("company_name") or "(회사명 미설정)",
-    "homepage": base.get("homepage"),
-    "wiki_summary": base.get("wiki_summary"),
-    "values": base.get("values", []),
-    "recent_projects": base.get("recent_projects", []),
-    "company_intro": job.get("company_intro") or base.get("company_intro"),
-    "news": base.get("news", []),
-    "role": job.get("role"),
-    "role_requirements": job.get("role_requirements", []),
-    "role_qualifications": job.get("role_qualifications", []),
-    "job_url": job.get("job_url")
-}
+# ==========================================================
+# ② 회사 요약 (LLM 생성) — 클립보드 기능 제거
+# ==========================================================
+st.subheader("② 회사 요약 (채용공고 기준)")
+if summary_md:
+    st.markdown(summary_md)
+    meta_cols = st.columns(3)
+    with meta_cols[0]:
+        if company.get("homepage"): st.link_button("홈페이지 열기", company["homepage"])
+    with meta_cols[1]:
+        if company.get("job_url"): st.link_button("채용 공고 열기", company["job_url"])
+    with meta_cols[2]:
+        if company.get("news"):
+            st.write("최근 뉴스:")
+            for n in company["news"][:3]:
+                st.markdown(f"- [{_clean_text(n['title'])}]({n['link']})")
+else:
+    st.info("위의 입력을 완료하고 ‘회사/직무 정보 불러오기’를 눌러 요약을 생성하세요.")
 
-# ③ 회사 요약 (채용공고 기준) --------------------------------
-st.subheader("③ 회사 요약 (채용공고 기준)")
-def build_company_summary_for_ui(c: dict) -> dict:
-    return {
-        "회사명": c.get("company_name"),
-        "간단 소개": c.get("company_intro") or c.get("wiki_summary"),
-        "모집 분야": c.get("role"),
-        "주요 업무(요약)": c.get("role_requirements")[:6],
-        "자격 요건(요약)": c.get("role_qualifications")[:6],
-        "핵심가치(추정)": c.get("values")[:6],
-        "홈페이지": c.get("homepage"),
-        "채용 공고": c.get("job_url"),
-        "최근 뉴스": [ n.get("title") for n in c.get("news", [])[:5] ],
-    }
-st.json(build_company_summary_for_ui(company), expanded=True)
-
-# ④ 질문 생성 ------------------------------------------------
-st.subheader("④ 질문 생성")
+# ==========================================================
+# ③ 질문 생성
+# ==========================================================
+st.subheader("③ 질문 생성")
 
 def embed_texts(client: OpenAI, embed_model: str, texts: list[str]) -> np.ndarray:
     if not texts:
@@ -579,7 +601,7 @@ def build_ctx(c: dict) -> str:
     news = ", ".join([_snippetize(n["title"], 70) for n in c.get("news", [])[:3]])
     return textwrap.dedent(f"""
     [회사명] {c.get('company_name','')}
-    [회사 소개] {c.get('company_intro') or c.get('wiki_summary') or ''}
+    [회사 소개] {c.get('company_intro_site') or ''}
     [모집 분야] {c.get('role','')}
     [주요 업무] {", ".join(c.get('role_requirements', [])[:6])}
     [자격 요건] {", ".join(c.get('role_qualifications', [])[:6])}
@@ -617,7 +639,15 @@ q_type = st.selectbox("질문 유형", list(TYPE_INSTRUCTIONS.keys()))
 level  = st.selectbox("난이도/연차", ["주니어","미들","시니어"])
 hint   = st.text_input("질문 생성 힌트(선택)", placeholder="예: 전환 퍼널 / 모델 성능-비용 / 데이터 품질")
 
-if st.button("새 질문 받기", use_container_width=True):
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "current_question" not in st.session_state:
+    st.session_state.current_question = ""
+
+# ✅ 새 질문 받기 버튼을 Primary(빨간색)로, 클릭 시 답변 입력칸 초기화
+if st.button("새 질문 받기", use_container_width=True, type="primary"):
+    # 2) 이전에 작성한 답변 지우기
+    st.session_state.answer_text = ""
     try:
         supports=[]
         if st.session_state.get("rag_on"):
@@ -638,8 +668,12 @@ if st.button("새 질문 받기", use_container_width=True):
 아래 '포커스' 중 최소 1개 키워드를 문장에 **명시적으로 포함**하고, 지표/수치/기간/규모/리스크 요소를 적절히 섞어라.
 포맷: 1) ... 2) ... 3) ... ... (한 줄씩)"""
         user = f"""[회사/직무 컨텍스트]\n{ctx}\n[포커스]\n- {chr(10).join(focuses)}{rag_note}\n[랜덤시드] {seed}"""
-        resp = client.chat.completions.create(model=MODEL, temperature=0.95,
-                                              messages=[{"role":"system","content":sys},{"role":"user","content":user}])
+
+        resp = client.chat.completions.create(
+            model=MODEL,
+            temperature=0.95,
+            messages=[{"role":"system","content":sys},{"role":"user","content":user}]
+        )
         raw = resp.choices[0].message.content.strip()
         cands = [re.sub(r'^\s*\d+\)\s*','',line).strip() for line in raw.splitlines() if re.match(r'^\s*\d+\)', line)]
         if not cands:
@@ -659,14 +693,17 @@ if st.session_state.get("rag_on") and st.session_state.get("last_supports_q"):
             st.markdown(f"**[{i}] sim={sc:.3f}**\n\n{txt[:600]}{'...' if len(txt)>600 else ''}")
             st.markdown("---")
 
-# ⑤ 나의 답변 / 코칭 -----------------------------------------
-st.subheader("⑤ 나의 답변 / 코칭")
+# ==========================================================
+# ④ 나의 답변 / 코칭 (100점제)
+# ==========================================================
+st.subheader("④ 나의 답변 / 코칭")
+
 def coach_answer(company: dict, question: str, answer: str, supports: list[Tuple[str,float,str]]) -> dict:
     comp = ["문제정의","데이터/지표","실행력/주도성","협업/커뮤니케이션","고객가치"]
     news = ", ".join([_snippetize(n["title"], 70) for n in company.get("news", [])[:3]])
     ctx = textwrap.dedent(f"""
     [회사명] {company.get('company_name','')}
-    [회사 소개] {company.get('company_intro') or company.get('wiki_summary') or ''}
+    [회사 소개] {company.get('company_intro_site') or ''}
     [모집 분야] {company.get('role','')}
     [주요 업무] {", ".join(company.get('role_requirements', [])[:6])}
     [자격 요건] {", ".join(company.get('role_qualifications', [])[:6])}
@@ -678,47 +715,71 @@ def coach_answer(company: dict, question: str, answer: str, supports: list[Tuple
         joined="\n".join([f"- ({s:.3f}) {txt[:500]}" for (_,s,txt) in supports])
         rag_note=f"\n[회사 근거 문서 발췌]\n{joined}\n"
     sys = f"""너는 톱티어 면접 코치다. 한국어로 아래 형식에 맞춰 답하라:
-1) 총점: 0~10 정수 1개
+1) 총점: 0~100 정수 1개
 2) 강점: 2~3개 불릿
 3) 리스크: 2~3개 불릿
 4) 개선 포인트: 3개 불릿 (행동·지표·임팩트 중심)
 5) 수정본 답변: STAR(상황-과제-행동-성과) 구조로 간결하고 자연스럽게
-6) 역량 점수: [{", ".join(comp)}] 각각 0~5 정수 (한 줄에 쉼표로 구분)
+6) 역량 점수(각 0~20 정수): [문제정의, 데이터/지표, 실행력/주도성, 협업/커뮤니케이션, 고객가치] — 한 줄에 숫자 5개만 쉼표로 구분해 출력
 채점 기준은 회사/직무 맥락, 채용공고(주요업무/자격요건), 질문 내 포커스/키워드 부합 여부를 포함한다.
-추가 설명 금지. 형식 유지."""
+추가 설명 금지. 형식/숫자 범위 엄수."""
     user = f"""[회사/직무 컨텍스트]\n{ctx}\n{rag_note}[면접 질문]\n{question}\n\n[후보자 답변]\n{answer}"""
     resp = client.chat.completions.create(model=MODEL, temperature=0.35,
                                           messages=[{"role":"system","content":sys},{"role":"user","content":user}])
     content = resp.choices[0].message.content.strip()
-    m = re.search(r'([0-9]{1,2})\s*(?:/10|점|$)', content)
-    score=None
-    if m:
-        try: score=max(0,min(10,int(m.group(1))))
-        except: pass
-    nums = re.findall(r'\b([0-5])\b', content.splitlines()[-1])
-    comp_scores=[int(x) for x in nums[:5]] if len(nums)>=5 else None
+
+    # ----- 총점 0~100 -----
+    score = None
+    m = re.search(r'(\d{1,3})\s*(?:/100|점|$)', content)
+    if m: score = int(m.group(1))
+    if score is None:
+        m10 = re.search(r'(\d{1,2})\s*/\s*10', content)
+        if m10: score = max(0, min(100, int(m10.group(1)) * 10))
+    if score is None:
+        m_any = re.search(r'\b(\d{1,3})\b', content)
+        if m_any: score = max(0, min(100, int(m_any.group(1))))
+    if score is not None:
+        score = max(0, min(100, score))
+
+    # ----- 역량 5개(0~20) -----
+    line = content.splitlines()[-1]
+    nums = re.findall(r'\b(\d{1,2})\b', line)
+    if len(nums) < 5:
+        nums = re.findall(r'\b(\d{1,2})\b', content)
+    comp_scores = None
+    if len(nums) >= 5:
+        cand = [int(x) for x in nums[:5]]
+        if all(0 <= x <= 5 for x in cand):
+            cand = [x * 4 for x in cand]
+        if all(0 <= x <= 10 for x in cand) and any(x > 5 for x in cand):
+            cand = [x * 2 for x in cand]
+        comp_scores = [max(0, min(20, x)) for x in cand]
+
     return {"raw": content, "score": score, "competencies": comp_scores}
 
 if "history" not in st.session_state:
     st.session_state.history = []
 
-ans = st.text_area("여기에 답변을 작성하세요 (STAR 권장: 상황-과제-행동-성과)", height=180)
+# ✅ 답변 입력칸을 세션 상태 key에 바인딩 (새 질문 시 초기화 가능)
+ans = st.text_area("여기에 답변을 작성하세요 (STAR 권장: 상황-과제-행동-성과)", height=180, key="answer_text")
+
+# 빨간색(Primary) 버튼
 if st.button("채점 & 코칭", type="primary", use_container_width=True):
     if not st.session_state.get("current_question"):
         st.warning("먼저 '새 질문 받기'로 질문을 생성하세요.")
-    elif not ans.strip():
+    elif not st.session_state.answer_text.strip():
         st.warning("답변을 작성해 주세요.")
     else:
         with st.spinner("코칭 중..."):
             sups=[]
             if st.session_state.get("rag_on"):
-                q_for_rag = st.session_state["current_question"] + "\n" + ans[:800]
+                q_for_rag = st.session_state["current_question"] + "\n" + st.session_state.answer_text[:800]
                 sups = retrieve_supports(q_for_rag, st.session_state.get("topk",4))
-            res = coach_answer(company, st.session_state["current_question"], ans, sups)
+            res = coach_answer(company, st.session_state["current_question"], st.session_state.answer_text, sups)
             st.session_state.history.append({
                 "ts": pd.Timestamp.now(),
                 "question": st.session_state["current_question"],
-                "user_answer": ans,
+                "user_answer": st.session_state.answer_text,
                 "score": res.get("score"),
                 "feedback": res.get("raw"),
                 "supports": sups,
@@ -731,7 +792,7 @@ st.subheader("피드백 결과")
 if st.session_state.history:
     last = st.session_state.history[-1]
     c1,c2 = st.columns([1,3])
-    with c1: st.metric("총점(/10)", last.get("score","—"))
+    with c1: st.metric("총점(/100)", last.get("score","—"))
     with c2: st.markdown(last.get("feedback",""))
 
     if st.session_state.get("rag_on") and last.get("supports"):
@@ -754,7 +815,7 @@ if cdf is not None:
     if PLOTLY_OK:
         fig = go.Figure()
         fig.add_trace(go.Scatterpolar(r=avg+[avg[0]], theta=competencies+[competencies[0]], fill='toself'))
-        fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0,5])), showlegend=False, height=420)
+        fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0,20])), showlegend=False, height=420)
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.bar_chart(pd.DataFrame({"score": avg}, index=competencies))
@@ -780,4 +841,4 @@ rep = build_report(st.session_state.history)
 st.download_button("CSV 다운로드", data=rep.to_csv(index=False).encode("utf-8-sig"),
                    file_name="interview_session_report.csv", mime="text/csv")
 
-st.caption("Tip) 네이버 키(NAVER_CLIENT_ID/SECRET)를 넣으면 뉴스·웹 탐색 정확도가 크게 향상됩니다. 위키 후보에서 정확한 회사를 선택하고, 가능하면 공고 URL을 입력하세요.")
+st.caption("Tip) 홈페이지/공고 URL을 넣으면 정확도가 크게 올라갑니다. 없으면 자동으로 커리어 링크→국내 포털 순으로 탐색합니다.")
