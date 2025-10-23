@@ -273,7 +273,7 @@ def _find_section_bullets(soup: BeautifulSoup, keys: list[str]) -> list[str]:
 def fetch_text_snapshot(url: str, timeout: int = 12) -> str:
     """r.jina.ai를 이용해 렌더된 페이지의 순수 텍스트를 가져온다."""
     try:
-        snap_url = "https://r.jina.ai/http/" + url.lstrip("http://").lstrip("https://")
+        snap_url = "https://r.jina.ai/http/" + re.sub(r"^https?://", "", url, flags=re.I)
         r = requests.get(snap_url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
         if r.status_code == 200 and r.text:
             # 너무 긴 경우 경량화
