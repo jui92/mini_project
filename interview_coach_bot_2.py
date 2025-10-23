@@ -166,7 +166,19 @@ if not API_KEY:
     st.error("OpenAI API Key가 필요합니다. Cloud에서는 App → Settings → Secrets에 등록하세요.")
     st.stop()
 
-client = OpenAI(api_key=API_KEY)
+try:
+    client = OpenAI(api_key=API_KEY, timeout=30.0)
+except TypeError:
+    st.error(
+        "OpenAI 클라이언트 초기화 중 TypeError가 발생했습니다.\n"
+        "대부분 `openai`와 `httpx` 버전 충돌입니다. "
+        "`requirements.txt`를 아래처럼 고정하고 Clear cache → Reboot 하세요:\n\n"
+        "openai==1.44.0\nhttpx==0.27.2"
+    )
+    st.stop()
+except Exception as e:
+    st.error(f"OpenAI 클라이언트 초기화 오류: {e}")
+    st.stop()
 
 
 # ============================================
