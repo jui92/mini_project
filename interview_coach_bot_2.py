@@ -415,7 +415,7 @@ except Exception as e:
 # ==========================================================
 # MAIN LAYOUT — ① 회사 입력 | ② 직무 입력  → ③ 요약 → ④ 질문 → ⑤ 답변
 # ==========================================================
-col_company, col_role = st.columns([1,1], vertical_alignment="start")
+col_company, col_role = st.columns([1, 1])
 
 # ① 회사 입력 ------------------------------------------------
 with col_company:
