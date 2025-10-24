@@ -276,12 +276,32 @@ def discover_job_posting_urls(company: str, role: str, homepage: str|None, limit
 # =========================================================
 # 원문 전체 텍스트 로더 (핵심)
 # =========================================================
+# 필요한 import
+import requests, re, urllib.parse
+from bs4 import BeautifulSoup
+
+# WebBaseLoader (langchain-community) 시도
+try:
+    from langchain_community.document_loaders import WebBaseLoader
+    WEBBASE_OK = True
+except Exception:
+    WEBBASE_OK = False
+
+# Playwright URL Loader (선택) - 설치 필요
+USE_PLAYWRIGHT = False
+try:
+    # from langchain.document_loaders import PlaywrightURLLoader # langchain 버전 따라 위치 다름
+    from langchain.document_loaders import PlaywrightURLLoader
+    PLAYWRIGHT_OK = True
+except Exception:
+    PLAYWRIGHT_OK = False
+
 UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124 Safari/537.36"
+                  "(KHTML, like Gecko) Chrome/124 Safari/537.36",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
 }
 
-# 1) WebBaseLoader 시도
 def webbase_dump_all_text(url: str) -> str:
     if not WEBBASE_OK or not url:
         return ""
@@ -292,43 +312,62 @@ def webbase_dump_all_text(url: str) -> str:
     except Exception:
         return ""
 
-# 2) 정적 HTML 파싱(BS4) 시도
 def bs4_dump_all_text(url: str) -> str:
     try:
         r = requests.get(url, timeout=12, headers=UA)
-        if r.status_code != 200 or "text/html" not in r.headers.get("content-type", ""):
+        if r.status_code != 200 or "text/html" not in r.headers.get("content-type",""):
             return ""
         soup = BeautifulSoup(r.text, "html.parser")
-        for tag in soup(["script", "style", "noscript"]):
+        for tag in soup(["script","style","noscript"]):
             tag.decompose()
         text = soup.get_text(separator="\n", strip=True)
         return re.sub(r"\n{3,}", "\n\n", text)
     except Exception:
         return ""
 
-# 3) Jina Reader(프리렌더 텍스트) 폴백
 def jina_reader_text(url: str) -> str:
     try:
+        # r.jina.ai proxy (프리렌더) — public 서비스, 도메인/리미트 주의
         proxied = "https://r.jina.ai/http/" + url
-        r = requests.get(proxied, timeout=15, headers=UA)
+        r = requests.get(proxied, timeout=18, headers=UA)
         if r.status_code != 200:
             return ""
         txt = r.text.strip()
-        return txt if len(txt) > 50 else ""
+        # 일부 페이지는 아주 짧은 텍스트만 반환하므로 길이 제한 완화
+        return txt if len(txt) > 10 else txt
     except Exception:
         return ""
 
-# 최종: WebBaseLoader → BS4 → Jina 순서로 시도
-def get_full_page_text(url: str) -> str:
-    if not url:
+def playwright_dump_all_text(url: str) -> str:
+    # Playwright 환경이 준비되어 있어야 함. Streamlit Cloud는 지원 여부 확인 필요.
+    if not PLAYWRIGHT_OK:
         return ""
+    try:
+        loader = PlaywrightURLLoader(urls=[url], browser_type="chromium", headless=True, wait_until="networkidle")
+        docs = loader.load()
+        return "\n\n".join([getattr(d, "page_content", "") for d in docs if getattr(d, "page_content", "")])
+    except Exception:
+        return ""
+
+def get_full_page_text(url: str) -> str:
+    # 정규화(간단)
+    if not url: return ""
+    if url.startswith("//"): url = "https:" + url
+    # 1) WebBaseLoader
     txt = webbase_dump_all_text(url)
     if txt and len(txt.strip()) > 50:
         return txt
+    # 2) BeautifulSoup
     txt = bs4_dump_all_text(url)
     if txt and len(txt.strip()) > 50:
         return txt
-    return jina_reader_text(url)
+    # 3) Jina 프리렌더
+    txt = jina_reader_text(url)
+    if txt and len(txt.strip()) > 10:
+        return txt
+    # 4) Playwright (가장 강력하지만 리소스/설치 필요)
+    txt = playwright_dump_all_text(url)
+    return txt or ""
 
 
 # =========================================================
