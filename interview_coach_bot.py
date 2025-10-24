@@ -496,6 +496,52 @@ if not API_KEY:
     st.error("OpenAI API Key가 필요합니다."); st.stop()
 client = OpenAI(api_key=API_KEY, timeout=30.0)
 
+# ---- URL 점수: 상세 + 직무명 포함 가점 ---------------------------------
+def _score_url_for_role(url: str, role: str) -> int:
+    score = 0
+    if DETAIL_HINTS.search(url or ""): score += 3
+    role = (role or "").lower()
+    if role:
+        for tok in re.split(r"[\/\s\-\_]+", role):
+            if tok and tok in url.lower():
+                score += 2
+    return score
+
+# ---- 다수 URL을 돌며 섹션별로 채워 넣기 ----------------------------------
+def merge_postings_by_need(urls: list[str], role: str = "") -> dict:
+    agg = {"title": None, "responsibilities": [], "qualifications": [], "preferred": [], "company_intro": None, "used_paths": []}
+    # 직무명과 상세성 점수로 우선순위 정렬
+    urls = sorted(list(dict.fromkeys(urls)), key=lambda u: -_score_url_for_role(u, role))
+    need_resp = need_qual = need_pref = True
+
+    for u in urls:
+        jp = parse_job_posting(u)
+        if not agg["title"] and jp.get("title"): agg["title"] = jp["title"]
+        if not agg["company_intro"] and jp.get("company_intro"): agg["company_intro"] = jp["company_intro"]
+
+        if need_resp and jp.get("responsibilities"):
+            agg["responsibilities"] += jp["responsibilities"]; need_resp = False; agg["used_paths"] += [f"merge:{u}:resp"]
+        if need_qual and jp.get("qualifications"):
+            agg["qualifications"]   += jp["qualifications"];   need_qual = False; agg["used_paths"] += [f"merge:{u}:qual"]
+        if need_pref and jp.get("preferred"):
+            agg["preferred"]        += jp["preferred"];        need_pref = False; agg["used_paths"] += [f"merge:{u}:pref"]
+
+        if not (need_resp or need_qual or need_pref):
+            break
+
+    # 중복 제거 & 길이 제한
+    def dedup(xs):
+        seen, out = set(), []
+        for x in xs:
+            x = _snippetize(x, 200)
+            if x and x not in seen:
+                seen.add(x); out.append(x)
+        return out[:25]
+    agg["responsibilities"] = dedup(agg["responsibilities"])
+    agg["qualifications"]   = dedup(agg["qualifications"])
+    agg["preferred"]        = dedup(agg["preferred"])
+    return agg
+
 # ==========================================================
 # 입력
 # ==========================================================
@@ -518,8 +564,16 @@ for k,v in defaults.items():
 
 def build_company(name: str, home: str|None, role: str|None, job_url: str|None) -> dict:
     site = fetch_site_snippets(home) if home else {"values":[], "recent":[], "about":None}
-    urls = [job_url] if job_url else discover_job_urls(name, role or "", home, limit=5)
-    jp = parse_job_posting(urls[0]) if urls else {"title":None,"responsibilities":[],"qualifications":[],"preferred":[],"company_intro":None,"used_paths":[]}
+
+    # URL이 있으면 바로 그 URL 우선, 없으면 자동 탐색
+    if job_url:
+        urls = [job_url]
+        jp = parse_job_posting(job_url)
+    else:
+        urls = discover_job_urls(name, role or "", home, limit=6)
+        # 여러 공고를 순차 파싱해 부족 섹션만 보완
+        jp = merge_postings_by_need(urls, role or "")
+
     news = naver_search_news(name, display=6) or []
     return {
         "company_name": name.strip() or "(회사명 미설정)",
@@ -536,6 +590,7 @@ def build_company(name: str, home: str|None, role: str|None, job_url: str|None) 
         "used_paths":            jp.get("used_paths", []),
         "news": news
     }
+
 
 def summarize_intro_only(c: dict) -> str:
     ctx = textwrap.dedent(f"""
@@ -571,31 +626,37 @@ intro   = st.session_state.get("company_state",{}).get("intro")
 # ==========================================================
 # ② 회사 요약 / 채용 요건 (원문)
 # ==========================================================
+# ==========================================================
+# ② 회사 요약 / 채용 요건 (원문) — 순차 레이아웃
+# ==========================================================
 st.subheader("② 회사 요약 / 채용 요건")
 if company and intro:
     st.markdown(f"**회사명**: {company['company_name']}")
     st.markdown("**회사 소개(요약)**")
     st.markdown(intro)
-    cols = st.columns(2)
-    with cols[0]:
+
+    link_cols = st.columns(2)
+    with link_cols[0]:
         if company.get("homepage"): st.link_button("홈페이지 열기", company["homepage"])
-    with cols[1]:
+    with link_cols[1]:
         if company.get("job_url"):  st.link_button("채용 공고 열기", company["job_url"])
+
     st.markdown("---")
     st.markdown(f"**모집 분야**: {company.get('role') or '—'}")
-    c1,c2,c3 = st.columns(3)
-    with c1:
-        st.markdown("**주요 업무(원문)**")
-        arr = company.get("role_responsibilities") or []
-        st.markdown("- " + "\n- ".join(arr) if arr else "_공고에서 추출된 주요 업무가 없습니다._")
-    with c2:
-        st.markdown("**자격 요건(원문)**")
-        arr = company.get("role_qualifications") or []
-        st.markdown("- " + "\n- ".join(arr) if arr else "_공고에서 추출된 자격 요건이 없습니다._")
-    with c3:
-        st.markdown("**우대 사항(원문)**")
-        arr = company.get("role_preferred") or []
-        st.markdown("- " + "\n- ".join(arr) if arr else "_공고에서 추출된 우대 사항이 없습니다._")
+
+    # ── 순차 출력 ──
+    def _print_bullets(title, arr):
+        st.markdown(f"### {title}")
+        if arr:
+            st.markdown("- " + "\n- ".join(arr))
+        else:
+            st.markdown(f"_공고에서 추출된 {title}이 없습니다._")
+        st.markdown("")  # space
+
+    _print_bullets("주요업무(원문)", company.get("role_responsibilities") or [])
+    _print_bullets("자격요건(원문)",   company.get("role_qualifications")   or [])
+    _print_bullets("우대사항(원문)",   company.get("role_preferred")        or [])
+
     with st.expander("디버그: 공고 추출 상태"):
         st.write({
             "job_url": company.get("job_url"),
@@ -606,6 +667,7 @@ if company and intro:
         })
 else:
     st.info("위 입력 후 ‘회사/직무 정보 불러오기’를 눌러 주세요.")
+
 
 # ==========================================================
 # ③ 질문 생성
