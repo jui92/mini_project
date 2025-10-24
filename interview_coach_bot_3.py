@@ -153,6 +153,25 @@ def naver_search_web(query: str, display: int = 10, sort: str = "date") -> list[
             links.append(link)
     return links
 
+# --- NEW: WebBaseLoader 전체 본문 덤프 ---------------------------------
+@st.cache_data(ttl=1800, show_spinner=False)
+def webbase_dump_all_text(url: str) -> str:
+    """
+    해당 URL을 WebBaseLoader로 로드해서 페이지의 텍스트를 '전부' 합쳐 반환.
+    - 여러 문서로 쪼개져 오면 page_content를 \n\n로 이어 붙임
+    - HTML 태그 제거는 WebBaseLoader가 처리
+    """
+    if not WEBBASE_OK or not url:
+        return ""
+    try:
+        loader = WebBaseLoader(url)
+        docs = loader.load()
+        full = "\n\n".join([getattr(d, "page_content", "") for d in docs if getattr(d, "page_content", "")])
+        # UI 렌더 보호를 위해 너무 길면 잘라서 표시하고, 다운로드는 전체 제공해도 됨
+        return full
+    except Exception as e:
+        return f"[WebBaseLoader 에러] {e}"
+
 # ---------- 사이트 크롤링 (About/Values 추정) ----------
 def fetch_site_snippets(base_url: str | None, company_name_hint: str | None = None) -> dict:
     if not base_url:
@@ -574,6 +593,34 @@ if summary_md:
     st.markdown(summary_md)
 else:
     st.info("위의 입력을 완료하고 ‘회사/직무 정보 불러오기’를 눌러 요약을 생성하세요.")
+# --- NEW: 원문 보기(WebBaseLoader) -------------------------------------
+with st.expander("원문 보기 (WebBaseLoader로 페이지 텍스트 그대로 보기)"):
+    if not WEBBASE_OK:
+        st.info("langchain-community 패키지가 필요합니다. requirements.txt에 `langchain-community>=0.2.0` 추가 후 배포하세요.")
+    else:
+        # 기본은 현재 감지된 채용 공고 URL 사용 (없으면 빈칸)
+        default_url = company.get("job_url") or ""
+        raw_url = st.text_input("대상 URL", value=default_url, placeholder="https://... (공고 상세 URL 권장)")
+        fetch_btn = st.button("원문 불러오기", use_container_width=True, key="btn_dump_webbase")
+        if fetch_btn:
+            if not raw_url:
+                st.warning("URL을 입력하세요.")
+            else:
+                with st.spinner("WebBaseLoader로 원문 수집 중..."):
+                    fulltext = webbase_dump_all_text(raw_url)
+                if not fulltext:
+                    st.error("텍스트를 가져오지 못했습니다. URL을 확인하거나 로그인/차단이 없는지 확인하세요.")
+                else:
+                    st.success("원문을 불러왔습니다.")
+                    # 화면 지연을 줄이고 싶으면 아래 value를 fulltext[:50000]처럼 자르세요.
+                    st.text_area("페이지 텍스트(전부)", value=fulltext, height=420)
+                    st.download_button(
+                        "원문 텍스트 다운로드",
+                        data=fulltext.encode("utf-8"),
+                        file_name="job_posting_raw.txt",
+                        mime="text/plain"
+                    )
+
 
 # ==========================================================
 # ③ 질문 생성 (RAG 옵션 포함)
