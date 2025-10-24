@@ -643,9 +643,9 @@ def generate_company_summary(c: dict) -> str:
             md.append(f"\n### {title}\n요약 가능한 {title.replace('(요약)','')}이 없습니다.")
             return
         md.append(f"\n### {title}\n" + "\n".join([f"- {it}" for it in items]))
-    bullets("주요업무(요약)", data["responsibilities"])
-    bullets("자격요건(요약)", data["qualifications"])
-    bullets("우대사항(요약)", data.get("preferences", []))
+    bullets("주요업무", data["responsibilities"])
+    bullets("자격요건", data["qualifications"])
+    bullets("우대사항", data.get("preferences", []))
 
     return "\n".join(md)
 
