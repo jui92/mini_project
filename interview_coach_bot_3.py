@@ -276,38 +276,60 @@ def discover_job_posting_urls(company: str, role: str, homepage: str|None, limit
 # =========================================================
 # 원문 전체 텍스트 로더 (핵심)
 # =========================================================
-@st.cache_data(ttl=1800, show_spinner=False)
+UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124 Safari/537.36"
+}
+
+# 1) WebBaseLoader 시도
 def webbase_dump_all_text(url: str) -> str:
-    """WebBaseLoader로 페이지 텍스트 전체 로드. 실패 시 빈 문자열."""
     if not WEBBASE_OK or not url:
         return ""
     try:
         loader = WebBaseLoader(url)
         docs = loader.load()
         return "\n\n".join([getattr(d, "page_content", "") for d in docs if getattr(d, "page_content", "")])
-    except Exception as e:
-        return ""
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def bs4_dump_all_text(url: str) -> str:
-    """BeautifulSoup로 전체 텍스트 폴백."""
-    try:
-        r = requests.get(url, timeout=12, headers=UA)
-        if r.status_code != 200 or "text/html" not in r.headers.get("content-type",""):
-            return ""
-        soup = BeautifulSoup(r.text, "html.parser")
-        return soup.get_text(separator="\n", strip=True)
     except Exception:
         return ""
 
+# 2) 정적 HTML 파싱(BS4) 시도
+def bs4_dump_all_text(url: str) -> str:
+    try:
+        r = requests.get(url, timeout=12, headers=UA)
+        if r.status_code != 200 or "text/html" not in r.headers.get("content-type", ""):
+            return ""
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n", strip=True)
+        return re.sub(r"\n{3,}", "\n\n", text)
+    except Exception:
+        return ""
+
+# 3) Jina Reader(프리렌더 텍스트) 폴백
+def jina_reader_text(url: str) -> str:
+    try:
+        proxied = "https://r.jina.ai/http/" + url
+        r = requests.get(proxied, timeout=15, headers=UA)
+        if r.status_code != 200:
+            return ""
+        txt = r.text.strip()
+        return txt if len(txt) > 50 else ""
+    except Exception:
+        return ""
+
+# 최종: WebBaseLoader → BS4 → Jina 순서로 시도
 def get_full_page_text(url: str) -> str:
-    """URL에서 페이지 텍스트 전체 확보(WebBaseLoader 우선 → BS4 폴백)."""
     if not url:
         return ""
     txt = webbase_dump_all_text(url)
-    if txt and len(_clean_text(txt)) > 20:
+    if txt and len(txt.strip()) > 50:
         return txt
-    return bs4_dump_all_text(url)
+    txt = bs4_dump_all_text(url)
+    if txt and len(txt.strip()) > 50:
+        return txt
+    return jina_reader_text(url)
+
 
 # =========================================================
 # OpenAI
