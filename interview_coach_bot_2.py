@@ -32,7 +32,7 @@ import requests
 from bs4 import BeautifulSoup
 
 # ---------- Page config ----------
-st.set_page_config(page_title="회사 특화 가상 면접 코치", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="회사 특화 가상 면접 코치", page_icon="🤖", layout="wide")
 
 # ---------- Secrets ----------
 def _secrets_file_exists() -> bool:
