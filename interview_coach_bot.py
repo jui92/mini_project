@@ -702,9 +702,9 @@ if st.session_state.get("rag_on") and st.session_state.get("last_supports_q"):
 st.subheader("④ 나의 답변 / 코칭")
 
 def coach_answer(company: dict, question: str, answer: str, supports: list[Tuple[str,float,str]]) -> dict:
-    comp_axes = ["문제정의","데이터/지표","실행력/주도성","협업/커뮤니케이션","고객가치"]
+    axes = ["문제정의","데이터/지표","실행력/주도성","협업/커뮤니케이션","고객가치"]
 
-    # 토큰 다이어트: 너무 긴 입력은 잘라서(정확도 유지)
+    # 토큰 다이어트
     q_trim = (question or "")[:500]
     a_trim = (answer or "")[:1200]
 
@@ -719,67 +719,80 @@ def coach_answer(company: dict, question: str, answer: str, supports: list[Tuple
     [최근 이슈/뉴스] {news}
     """).strip()
 
-    rag_note=""
+    rag_note = ""
     if supports:
-        joined="\n".join([f"- ({s:.3f}) {txt[:500]}" for (_,s,txt) in supports])
-        rag_note=f"\n[회사 근거 문서 발췌]\n{joined}\n"
+        joined = "\n".join([f"- ({s:.3f}) {txt[:500]}" for (_, s, txt) in supports])
+        rag_note = f"\n[회사 근거 문서 발췌]\n{joined}\n"
 
-    sys = f"""너는 톱티어 면접 코치다. 한국어로 아래 형식에 맞춰 답하라:
-1) 총점: 0~100 정수 1개
-2) 강점: 2~3개 불릿
-3) 리스크: 2~3개 불릿
-4) 개선 포인트: 3개 불릿 (행동·지표·임팩트 중심)
-5) 수정본 답변: STAR(상황-과제-행동-성과) 구조로 간결하고 자연스럽게
-6) 역량 점수(각 0~20 정수): [문제정의, 데이터/지표, 실행력/주도성, 협업/커뮤니케이션, 고객가치] — 한 줄에 숫자 5개만 쉼표로 구분해 출력
-추가 설명 금지. 형식/숫자 범위 엄수."""
-    user = f"""[회사/직무 컨텍스트]\n{ctx}\n{rag_note}[면접 질문]\n{q_trim}\n\n[후보자 답변]\n{a_trim}"""
+    sys = (
+        "너는 톱티어 면접 코치다. 한국어로 아래 형식에 맞춰 답하라:\n"
+        "1) 총점: 0~100 정수 1개\n"
+        "2) 강점: 2~3개 불릿\n"
+        "3) 리스크: 2~3개 불릿\n"
+        "4) 개선 포인트: 3개 불릿 (행동·지표·임팩트 중심)\n"
+        "5) 수정본 답변: STAR(상황-과제-행동-성과) 구조로 간결하고 자연스럽게\n"
+        "6) 역량 점수(각 0~20 정수): [문제정의, 데이터/지표, 실행력/주도성, 협업/커뮤니케이션, 고객가치] — 한 줄에 숫자 5개만 쉼표로 구분해 출력\n"
+        "추가 설명 금지. 형식/숫자 범위 엄수."
+    )
+    user = f"[회사/직무 컨텍스트]\n{ctx}\n{rag_note}[면접 질문]\n{q_trim}\n\n[후보자 답변]\n{a_trim}"
 
-    resp = client.chat.completions.create(model=MODEL, temperature=0.35,
-                                          messages=[{"role":"system","content":sys},{"role":"user","content":user}])
+    resp = client.chat.completions.create(
+        model=MODEL, temperature=0.35,
+        messages=[{"role":"system","content":sys},{"role":"user","content":user}]
+    )
     content = resp.choices[0].message.content.strip()
 
-    # ----- 모델이 기입한 총점(가능하면) -----
-    score = None
-    m = re.search(r'총점\s*[:：]?\s*(\d{1,3})', content)
-    if m:
-        try:
-            score = max(0, min(100, int(m.group(1))))
-        except Exception:
-            score = None
+    # ---- ① '역량 점수' 라인만 엄격 파싱 ----
+    comp_line = None
+    for line in content.splitlines()[::-1]:  # 아래쪽부터 탐색
+        if re.search(r"^\s*6\.\s*|\b역량\s*점수", line):
+            comp_line = line
+            break
+    comps = None
+    if comp_line:
+        nums = re.findall(r"(?:^|[^\d])(1?\d|20)(?=(?:\s*,|\s*$))", comp_line)  # 0~20, 콤마 구분
+        if len(nums) >= 5:
+            comps = [int(n) for n in nums[:5]]
 
-    # ----- 역량 5개(0~20) 파싱 & 보정 -----
-    last_line = content.splitlines()[-1] if content.splitlines() else ""
-    nums = re.findall(r'\b(\d{1,2})\b', last_line)
-    if len(nums) < 5:
-        nums = re.findall(r'\b(\d{1,2})\b', content)
-    competencies = None
-    if len(nums) >= 5:
-        cand = [int(x) for x in nums[:5]]
-        if all(0 <= x <= 5 for x in cand):
-            cand = [x * 4 for x in cand]
-        elif all(0 <= x <= 10 for x in cand) and any(x > 5 for x in cand):
-            cand = [x * 2 for x in cand]
-        competencies = [max(0, min(20, x)) for x in cand]
+    # 보조 규칙: [a, b, c, d, e] 형태
+    if comps is None:
+        m = re.search(r"\[(.*?)\]", content)
+        if m:
+            nums = re.findall(r"(1?\d|20)", m.group(1))
+            if len(nums) >= 5:
+                comps = [int(n) for n in nums[:5]]
 
-    # ✅ 최종 총점: 역량 평균×5(우선). 없으면 모델 총점. 최종 0~100 정수
-    if competencies and len(competencies) == 5:
-        final_score = int(round(sum(competencies) / 5.0 * 5))
+    # 최후 보조: 본문에서 '마지막' 수열(숫자 5개)을 잡되 0~20 범위만 허용
+    if comps is None:
+        candidates = re.findall(r"(?:^|[^0-9])((?:\d{1,2}\s*,\s*){4}\d{1,2})(?!\s*[,0-9])", content)
+        if candidates:
+            nums = re.findall(r"(1?\d|20)", candidates[-1])
+            if len(nums) == 5:
+                comps = [int(n) for n in nums]
+
+    # 안전 보정
+    if comps:
+        comps = [max(0, min(20, int(x))) for x in comps]
     else:
-        final_score = score if score is not None else 0
+        comps = [0, 0, 0, 0, 0]
 
-    # ✅ 피드백 본문 첫 부분의 '총점:' 강제 치환 → 좌/우 반드시 동일
+    # ---- ② 총점은 항상 합계로 결정 ----
+    final_score = int(sum(comps))
+
+    # ---- ③ 피드백 본문에 총점 강제 반영 (좌/우 동일) ----
     lines = content.splitlines()
-    replaced = False
-    for i, L in enumerate(lines[:4]):  # 상단 몇 줄 안에서만 교체
+    injected = False
+    for i, L in enumerate(lines[:6]):  # 상단 6줄 안에서 총점 라인 치환
         if "총점" in L:
             lines[i] = re.sub(r"총점\s*[:：]?\s*\d{1,3}(?:\s*/\s*100)?", f"총점: {final_score}/100", L)
-            replaced = True
+            injected = True
             break
-    if not replaced:
+    if not injected:
         lines.insert(0, f"총점: {final_score}/100")
     content_fixed = "\n".join(lines)
 
-    return {"raw": content_fixed, "score": final_score, "competencies": competencies}
+    return {"raw": content_fixed, "score": final_score, "competencies": comps}
+
 
 if "history" not in st.session_state:
     st.session_state.history = []
