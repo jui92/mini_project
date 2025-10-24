@@ -433,7 +433,7 @@ def extract_with_webbase_and_llm(url: str, client: OpenAI, model: str, force_sum
                "불릿 리스트로 추출하고 JSON만 반환하라. 키는 responsibilities, qualifications, preferences. "
                "각 리스트는 3~12개 항목. 불필요한 말 금지.")
         if force_summary:
-            sys = sys.replace("최대한 보존", "핵심만 간결히 요약")
+            sys = sys.replace("최대한 보존", "핵심 키워드 포함", "요약")
 
         user = f"[원문]\n{body}"
         resp = client.chat.completions.create(
