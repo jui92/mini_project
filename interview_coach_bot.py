@@ -1,23 +1,23 @@
 # -*- coding: utf-8 -*-
 # ==========================================================
-# 회사 특화 가상 면접 코치 (KR)
-# - 회사 소개만 LLM 요약 / 채용 요건(업무·자격·우대)은 '원문 그대로'
-# - 동적 채용 공고 대응: r.jina.ai 스냅샷 + 사이트별 처리 + 섹션 헤더 우선 분리 + 불릿 분류기
-# - 자동 상세 공고 URL 우선 선택(목록 페이지 제거)
-# - 질문 다양화 / RAG(선택)
-# - 채점: 적용 가능한 축에 한해 0~20 채점, 총점 = (적용축 평균 × 5) → 100점
-# - 점수 일관화: 좌/우/CSV/레이더 모두 동일 점수 사용
-# - 레이더 표에 '합계' 추가(비적용은 제외하고 합산)
+# 회사 특화 가상 면접 코치 (KR) — 안전판
+# - 회사 소개: 요약 (LLM)
+# - 채용 요건(업무/자격/우대): '원문 그대로' 추출
+# - 포털 화이트리스트 우선 + 상세 공고 URL 우선
+# - 동적 페이지: r.jina.ai 스냅샷 + 섹션 헤더 분리 + 불릿 분류
+# - 섹션별 충전 로직(업무/자격/우대 각각 비면 계속 시도)
+# - 질문 다양화, RAG(선택), 채점(0~20, 적용축 평균×5=100)
+# - 디버그 used_paths로 추출 경로 가시화
 # ==========================================================
 
-import os, io, re, json, textwrap, urllib.parse, difflib, random, functools
-from typing import List, Dict, Tuple, Optional
+import os, io, re, json, textwrap, urllib.parse, difflib, random, functools, html
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---------- optional dependencies ----------
+# ---------- optional deps ----------
 try:
     import pypdf
 except Exception:
@@ -32,7 +32,7 @@ except Exception:
 try:
     from openai import OpenAI
 except ImportError:
-    st.error("`openai` 패키지가 필요합니다. requirements.txt에 openai를 추가했는지 확인하세요.")
+    st.error("`openai` 패키지를 설치하세요. (requirements.txt에 openai 포함)")
     st.stop()
 
 import requests
@@ -140,9 +140,8 @@ def _naver_api_get(api: str, params: dict, cid: str, csec: str):
         return None
 
 def naver_search_news(q: str, display: int = 6) -> list[dict]:
-    cid, csec = load_naver_keys()
-    if not (cid and csec): return []
-    js = _naver_api_get("news", {"query": q, "display": display, "sort": "date"}, cid, csec)
+    if not (NAVER_ID and NAVER_SECRET): return []
+    js = _naver_api_get("news", {"query": q, "display": display, "sort": "date"}, NAVER_ID, NAVER_SECRET)
     if not js: return []
     out=[]
     for it in js.get("items", []):
@@ -150,10 +149,9 @@ def naver_search_news(q: str, display: int = 6) -> list[dict]:
         out.append({"title": title, "link": it.get("link"), "pubDate": it.get("pubDate")})
     return out
 
-def naver_search_web(q: str, display: int = 5) -> list[str]:
-    cid, csec = load_naver_keys()
-    if not (cid and csec): return []
-    js = _naver_api_get("webkr", {"query": q, "display": display, "sort": "date"}, cid, csec)
+def naver_search_web(q: str, display: int = 7) -> list[str]:
+    if not (NAVER_ID and NAVER_SECRET): return []
+    js = _naver_api_get("webkr", {"query": q, "display": display, "sort": "date"}, NAVER_ID, NAVER_SECRET)
     if not js: return []
     links=[]
     for it in js.get("items", []):
@@ -170,9 +168,9 @@ def fetch_site_snippets(home: str|None) -> dict:
     if not home.startswith(("http://","https://")): home = "https://" + home
     values, recent, about = [], [], None
     for path in ["","/about","/company","/about-us"]:
-        html = _cached_get(home.rstrip("/") + path, timeout=6)
-        if not html: continue
-        soup = BeautifulSoup(html, "html.parser")
+        html_txt = _cached_get(home.rstrip("/") + path, timeout=6)
+        if not html_txt: continue
+        soup = BeautifulSoup(html_txt, "html.parser")
         if about is None:
             hero = soup.find(["p","div"], class_=re.compile(r"(lead|hero|intro)", re.I))
             if hero: about = _snippetize(hero.get_text(" "))
@@ -198,9 +196,9 @@ DETAIL_HINTS = re.compile(r"(job|position|posting|recruit|notice|opening).*(\d{3
 def discover_job_from_homepage(home: str, limit: int = 3) -> list[str]:
     if not home: return []
     if not home.startswith(("http://","https://")): home = "https://" + home
-    html = _cached_get(home, timeout=8)
-    if not html: return []
-    soup = BeautifulSoup(html, "html.parser")
+    html_txt = _cached_get(home, timeout=8)
+    if not html_txt: return []
+    soup = BeautifulSoup(html_txt, "html.parser")
     links=[]
     for path in ["careers","recruit","jobs","career","채용","인재영입","recruitment","join"]:
         links.append(urllib.parse.urljoin(home.rstrip("/") + "/", path))
@@ -214,16 +212,16 @@ def discover_job_from_homepage(home: str, limit: int = 3) -> list[str]:
         if len(out)>=limit: break
     return out
 
-def discover_job_urls(name: str, role: str, home: str|None, limit: int = 3) -> list[str]:
+def discover_job_urls(name: str, role: str, home: str|None, limit: int = 5) -> list[str]:
     urls=[]
     if home: urls += discover_job_from_homepage(home, limit=limit)
-    if NAVER_ID and NAVER_SECRET:
-        for dom in JOB_SITES:
-            if len(urls)>=limit: break
-            q = f"{name} {role} site:{dom}" if role else f"{name} 채용 site:{dom}"
-            links = naver_search_web(q, display=7)
-            for lk in links:
-                urls.append(lk)
+    # 네이버 포털 화이트리스트 site: 검색
+    for dom in JOB_SITES:
+        if len(urls)>=limit: break
+        q = f"{name} {role} site:{dom}" if role else f"{name} 채용 site:{dom}"
+        links = naver_search_web(q, display=7)
+        for lk in links:
+            urls.append(lk)
     # 상세 공고 URL 우선 정렬 + 중복 제거
     uniq = []
     for u in urls:
@@ -233,7 +231,7 @@ def discover_job_urls(name: str, role: str, home: str|None, limit: int = 3) -> l
 
 # ---------- dynamic snapshot (Jina Reader) ----------
 def fetch_text_snapshot(url: str, timeout: int = 12) -> str:
-    """렌더된 페이지 텍스트 스냅샷(r.jina.ai). lstrip 버그 없이 안전하게."""
+    """렌더된 페이지 텍스트 스냅샷(r.jina.ai)."""
     try:
         if not url.startswith(("http://","https://")):
             url = "https://" + url
@@ -246,61 +244,42 @@ def fetch_text_snapshot(url: str, timeout: int = 12) -> str:
         pass
     return ""
 
-# ---------- job posting parser (강화) ----------
-RESP_KEYS = ["주요 업무","담당 업무","업무","Responsibilities","What you will do","Role","Your role","What you'll do"]
-QUAL_KEYS = ["자격 요건","지원 자격","Requirements","Qualifications","Must have","Required","Basic qualifications"]
-PREF_KEYS = ["우대","우대사항","Preferred","Nice to have","Plus","Preferred qualifications"]
-
+# ---------- parser helpers ----------
 RESP_HINTS = [
     "업무","담당","책임","역할","Role","Responsibilities","Work you'll do","What you will do","What you'll do",
     "You will","Key responsibilities","미션","Mission"
 ]
 QUAL_HINTS = [
     "자격","요건","필수","필수조건","필수역량","Requirements","Qualifications","Must have","Required",
-    "Basic qualifications","조건","경력","학력","필요 스킬","필수 기술","필수 경험","우리가 찾는 인재"
+    "Basic qualifications","조건","경력","학력","필요 스킬","필수 기술","필수 경험","우리가 찾는 인재",
+    "최소 요건","지원 조건"
 ]
 PREF_HINTS = [
     "우대","가산점","Preferred","Nice to have","Plus","우대사항","있으면 좋은","우대 역량","가점","선호",
-    "Preferred qualifications","Bonus points"
+    "Preferred qualifications","Bonus points","우대 조건"
 ]
-
-def _extract_json_ld_job(soup: BeautifulSoup) -> Optional[dict]:
-    for s in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(s.string or "")
-            seq = data if isinstance(data, list) else [data]
-            for obj in seq:
-                typ = obj.get("@type") if isinstance(obj, dict) else None
-                if (isinstance(typ, list) and "JobPosting" in typ) or typ == "JobPosting":
-                    return obj
-        except Exception:
-            continue
-    return None
 
 def _split_bullets(txt: str) -> list[str]:
     arr = re.split(r"[\n\r]+|[•·▪️▶︎\-]\s+|•\s*", txt or "")
     return [a.strip(" -•·▪️▶︎") for a in arr if len(a.strip())>2]
 
-def classify_bullets(lines: list[str]) -> tuple[list[str], list[str], list[str]]:
+def classify_bullets(lines: list[str]):
     resp, qual, pref = [], [], []
     for s in lines:
         t = s.strip(" -•·▪️▶︎").strip()
         if len(t) < 3: 
             continue
         low = t.lower()
-        # 우대 → 자격 → 업무 순으로 우선 분류
         if any(k.lower() in low for k in PREF_HINTS):
             pref.append(t);  continue
         if any(k.lower() in low for k in QUAL_HINTS):
             qual.append(t);  continue
         if any(k.lower() in low for k in RESP_HINTS):
             resp.append(t);  continue
-        # 신호 기반 휴리스틱
         if re.search(r"(경력\s*\d+|~\s*\d+\s*년|신입|인턴|정규직|학력|전공|자격증|영어|토익|OPIc|JLPT|정보처리기사|Certification|Bachelor|Master|PhD)", t, re.I):
             qual.append(t); continue
         if re.search(r"^(설계|구현|개발|운영|분석|작성|개선|관리|Design|Implement|Build|Operate|Analyze|Lead)\b", t, re.I):
             resp.append(t); continue
-        # 기본값: 업무
         resp.append(t)
     def clean(xs):
         out, seen = [], set()
@@ -311,29 +290,7 @@ def classify_bullets(lines: list[str]) -> tuple[list[str], list[str], list[str]]
         return out[:25]
     return clean(resp), clean(qual), clean(pref)
 
-def _find_section_bullets(soup: BeautifulSoup, keys: list[str]) -> list[str]:
-    for h in soup.find_all(re.compile("^h[1-4]$")):
-        head = _clean_text(h.get_text())
-        if any(k.lower() in head.lower() for k in keys):
-            bul=[]
-            nxt=h.find_next_sibling()
-            stop=set(["h1","h2","h3","h4"])
-            while nxt and nxt.name not in stop:
-                if nxt.name in {"ul","ol"}:
-                    for li in nxt.find_all("li"):
-                        t=_clean_text(li.get_text(" "))
-                        if len(t)>2: bul.append(t)
-                elif nxt.name in {"p","div"}:
-                    bul += _split_bullets(nxt.get_text(" "))
-                nxt=nxt.find_next_sibling()
-            if bul: return bul
-    body_text = soup.get_text("\n")
-    if any(k.lower() in body_text.lower() for k in keys):
-        return _split_bullets(body_text)
-    return []
-
 def split_by_sections(text: str) -> dict:
-    """스냅샷 텍스트에서 섹션 헤더로 큰 덩어리를 먼저 분리"""
     pats = {
         "resp": r"(주요\s*업무|담당\s*업무|Responsibilities?|Role|What you will do|What you'll do)",
         "qual": r"(자격\s*요건|지원\s*자격|Requirements?|Qualifications?|Must\s+have|Required|Basic\s+qualifications?)",
@@ -355,8 +312,9 @@ def split_by_sections(text: str) -> dict:
         pass
     return sec
 
+# ---------- job posting parser ----------
 def parse_job_posting(url: str) -> dict:
-    out = {"title": None, "responsibilities": [], "qualifications": [], "preferred": [], "company_intro": None}
+    out = {"title": None, "responsibilities": [], "qualifications": [], "preferred": [], "company_intro": None, "used_paths": []}
     try:
         r = requests.get(url, timeout=12, headers={"User-Agent":"Mozilla/5.0"})
         if r.status_code == 200 and "text/html" in r.headers.get("content-type",""):
@@ -367,101 +325,141 @@ def parse_job_posting(url: str) -> dict:
             if meta_desc and meta_desc.get("content"):
                 out["company_intro"] = _snippetize(meta_desc["content"], 220)
 
-            # 1) JSON-LD
-            jp = _extract_json_ld_job(soup)
-            if jp:
-                out["title"] = jp.get("title") or out["title"]
-                desc = _clean_text(jp.get("description",""))
-                if desc:
-                    lines = _split_bullets(desc)
-                    r1,q1,p1 = classify_bullets(lines)
-                    out["responsibilities"] += r1; out["qualifications"] += q1; out["preferred"] += p1
-
             host = (_domain(url) or "")
-            got = lambda: (out["responsibilities"] or out["qualifications"] or out["preferred"])
 
-            # 2) 사이트별 전용
-            if "wanted.co.kr" in host and not got():
-                nd = soup.find("script", id="__NEXT_DATA__")
-                if nd and nd.string:
-                    try:
-                        data = json.loads(nd.string)
-                        text_fields=[]
-                        def walk(x):
-                            if isinstance(x, dict):
-                                for k,v in x.items():
-                                    if isinstance(v, (dict, list)):
-                                        walk(v)
-                                    elif isinstance(v, str) and len(v) > 20:
-                                        if any(tk in k.lower() for tk in ["description","requirement","qualification","preference","responsibil"]):
-                                            text_fields.append(v)
-                            elif isinstance(x, list):
-                                for it in x: walk(it)
-                        walk(data)
-                        lines=[]
-                        for t in text_fields: lines += _split_bullets(t)
-                        r2,q2,p2 = classify_bullets(lines)
-                        out["responsibilities"] += r2; out["qualifications"] += q2; out["preferred"] += p2
-                    except Exception:
-                        pass
+            # 섹션별 필요 플래그
+            need_resp = not out["responsibilities"]
+            need_qual = not out["qualifications"]
+            need_pref = not out["preferred"]
 
-            if "saramin.co.kr" in host and not got():
-                body = soup.select_one("#job_summary, .user_content, .wrap_jview, .content")
-                if body:
-                    lines = _split_bullets(body.get_text("\n"))
-                    r3,q3,p3 = classify_bullets(lines)
-                    out["responsibilities"] += r3; out["qualifications"] += q3; out["preferred"] += p3
-
-            if "jobkorea.co.kr" in host and not got():
-                body = soup.select_one("#tab02, .detailArea, .recruitMent, .smartApply, .viewContents")
-                if body:
-                    lines = _split_bullets(body.get_text("\n"))
-                    r4,q4,p4 = classify_bullets(lines)
-                    out["responsibilities"] += r4; out["qualifications"] += q4; out["preferred"] += p4
-
-            if "rocketpunch.com" in host and not got():
-                body = soup.select_one(".job-detail, .description, .job-detail__full")
-                if body:
-                    lines = _split_bullets(body.get_text("\n"))
-                    r5,q5,p5 = classify_bullets(lines)
-                    out["responsibilities"] += r5; out["qualifications"] += q5; out["preferred"] += p5
-
-            # 3) 일반 섹션 헤더
-            if not got():
-                body_text = soup.get_text("\n")
-                # 헤더 분리 먼저
-                sec = split_by_sections(body_text)
-                if sec.get("resp"): out["responsibilities"] += _split_bullets(sec["resp"])
-                if sec.get("qual"): out["qualifications"]   += _split_bullets(sec["qual"])
-                if sec.get("pref"): out["preferred"]        += _split_bullets(sec["pref"])
-                # 그래도 부족하면 전체를 분류기로
-                if not got():
-                    lines = _split_bullets(body_text)
-                    r6,q6,p6 = classify_bullets(lines)
-                    out["responsibilities"] += r6; out["qualifications"] += q6; out["preferred"] += p6
-
-        # 4) 스냅샷 폴백(섹션 헤더 → 불릿 분류)
-        if not (out["responsibilities"] or out["qualifications"] or out["preferred"]):
-            snap = fetch_text_snapshot(url)
-            if snap:
-                sec = split_by_sections(snap)
-                if sec.get("resp"): out["responsibilities"] += _split_bullets(sec["resp"])
-                if sec.get("qual"): out["qualifications"]   += _split_bullets(sec["qual"])
-                if sec.get("pref"): out["preferred"]        += _split_bullets(sec["pref"])
-                if not (out["responsibilities"] or out["qualifications"] or out["preferred"]):
-                    r7,q7,p7 = classify_bullets(_split_bullets(snap))
-                    out["responsibilities"] += r7; out["qualifications"] += q7; out["preferred"] += p7
-
-        # 5) <li> 폴백(최후)
-        if not (out["responsibilities"] or out["qualifications"] or out["preferred"]):
+            # 1) JSON-LD
             try:
-                soup2 = BeautifulSoup(r.text, "html.parser")
-                lis = [ _clean_text(li.get_text(" ")) for li in soup2.find_all("li") ]
-                r8,q8,p8 = classify_bullets(lis)
-                out["responsibilities"] += r8; out["qualifications"] += q8; out["preferred"] += p8
+                for s in soup.find_all("script", type="application/ld+json"):
+                    data = json.loads(s.string or "")
+                    seq = data if isinstance(data, list) else [data]
+                    for obj in seq:
+                        typ = obj.get("@type") if isinstance(obj, dict) else None
+                        if (isinstance(typ, list) and "JobPosting" in typ) or typ == "JobPosting":
+                            desc = _clean_text(obj.get("description",""))
+                            if desc:
+                                r_,q_,p_ = classify_bullets(_split_bullets(desc))
+                                if need_resp and r_: out["responsibilities"] += r_; need_resp=False; out["used_paths"].append("jsonld.resp")
+                                if need_qual and q_: out["qualifications"]   += q_; need_qual=False; out["used_paths"].append("jsonld.qual")
+                                if need_pref and p_: out["preferred"]        += p_; need_pref=False; out["used_paths"].append("jsonld.pref")
+                            break
             except Exception:
                 pass
 
+            # 2) 사이트별 전용 (Wanted / Saramin / JobKorea / Rocketpunch)
+            if ("wanted.co.kr" in host) and (need_resp or need_qual or need_pref):
+                nd = soup.find("script", id="__NEXT_DATA__")
+                if nd and nd.string:
+                    try:
+                        data = json.loads(html.unescape(nd.string))
+                        text_fields=[]
+                        def walk(x, key=""):
+                            if isinstance(x, dict):
+                                for k,v in x.items():
+                                    walk(v, k)
+                            elif isinstance(x, list):
+                                for it in x: walk(it, key)
+                            elif isinstance(x, str):
+                                kl=(key or "").lower()
+                                if any(t in kl for t in ["desc","require","qualif","prefer","responsib","detail"]):
+                                    text_fields.append(x)
+                        walk(data)
+                        lines=[]
+                        for t in text_fields:
+                            t_clean = BeautifulSoup(t, "html.parser").get_text("\n")
+                            lines += _split_bullets(t_clean)
+                        r_,q_,p_ = classify_bullets(lines)
+                        if need_resp and r_: out["responsibilities"] += r_; need_resp=False; out["used_paths"].append("wanted.nextdata.resp")
+                        if need_qual and q_: out["qualifications"]   += q_; need_qual=False; out["used_paths"].append("wanted.nextdata.qual")
+                        if need_pref and p_: out["preferred"]        += p_; need_pref=False; out["used_paths"].append("wanted.nextdata.pref")
+                    except Exception:
+                        pass
+
+            if ("saramin.co.kr" in host) and (need_resp or need_qual or need_pref):
+                body = soup.select_one("#job_summary, .user_content, .wrap_jview, .content")
+                if body:
+                    lines = _split_bullets(body.get_text("\n"))
+                    r_,q_,p_ = classify_bullets(lines)
+                    if need_resp and r_: out["responsibilities"] += r_; need_resp=False; out["used_paths"].append("saramin.sel.resp")
+                    if need_qual and q_: out["qualifications"]   += q_; need_qual=False; out["used_paths"].append("saramin.sel.qual")
+                    if need_pref and p_: out["preferred"]        += p_; need_pref=False; out["used_paths"].append("saramin.sel.pref")
+
+            if ("jobkorea.co.kr" in host) and (need_resp or need_qual or need_pref):
+                body = soup.select_one("#tab02, .detailArea, .recruitMent, .smartApply, .viewContents")
+                if body:
+                    lines = _split_bullets(body.get_text("\n"))
+                    r_,q_,p_ = classify_bullets(lines)
+                    if need_resp and r_: out["responsibilities"] += r_; need_resp=False; out["used_paths"].append("jobkorea.sel.resp")
+                    if need_qual and q_: out["qualifications"]   += q_; need_qual=False; out["used_paths"].append("jobkorea.sel.qual")
+                    if need_pref and p_: out["preferred"]        += p_; need_pref=False; out["used_paths"].append("jobkorea.sel.pref")
+
+            if ("rocketpunch.com" in host) and (need_resp or need_qual or need_pref):
+                body = soup.select_one(".job-detail, .description, .job-detail__full")
+                if body:
+                    lines = _split_bullets(body.get_text("\n"))
+                    r_,q_,p_ = classify_bullets(lines)
+                    if need_resp and r_: out["responsibilities"] += r_; need_resp=False; out["used_paths"].append("rocketpunch.sel.resp")
+                    if need_qual and q_: out["qualifications"]   += q_; need_qual=False; out["used_paths"].append("rocketpunch.sel.qual")
+                    if need_pref and p_: out["preferred"]        += p_; need_pref=False; out["used_paths"].append("rocketpunch.sel.pref")
+
+            # 3) 일반 섹션 헤더 (정적 HTML)
+            if (need_resp or need_qual or need_pref):
+                body_text = soup.get_text("\n")
+                sec = split_by_sections(body_text)
+                if need_resp and sec.get("resp"):
+                    out["responsibilities"] += _split_bullets(sec["resp"]); need_resp=False; out["used_paths"].append("html.section.resp")
+                if need_qual and sec.get("qual"):
+                    out["qualifications"]   += _split_bullets(sec["qual"]); need_qual=False; out["used_paths"].append("html.section.qual")
+                if need_pref and sec.get("pref"):
+                    out["preferred"]        += _split_bullets(sec["pref"]); need_pref=False; out["used_paths"].append("html.section.pref")
+
+                if (need_resp or need_qual or need_pref):
+                    r_,q_,p_ = classify_bullets(_split_bullets(body_text))
+                    if need_resp and r_: out["responsibilities"] += r_; need_resp=False; out["used_paths"].append("html.classifier.resp")
+                    if need_qual and q_: out["qualifications"]   += q_; need_qual=False; out["used_paths"].append("html.classifier.qual")
+                    if need_pref and p_: out["preferred"]        += p_; need_pref=False; out["used_paths"].append("html.classifier.pref")
+
+        # 4) 스냅샷 폴백
+        need_resp = not out["responsibilities"]
+        need_qual = not out["qualifications"]
+        need_pref = not out["preferred"]
+        if (need_resp or need_qual or need_pref):
+            snap = fetch_text_snapshot(url)
+            if snap:
+                sec = split_by_sections(snap)
+                if need_resp and sec.get("resp"):
+                    out["responsibilities"] += _split_bullets(sec["resp"]); need_resp=False; out["used_paths"].append("snap.section.resp")
+                if need_qual and sec.get("qual"):
+                    out["qualifications"]   += _split_bullets(sec["qual"]); need_qual=False; out["used_paths"].append("snap.section.qual")
+                if need_pref and sec.get("pref"):
+                    out["preferred"]        += _split_bullets(sec["pref"]); need_pref=False; out["used_paths"].append("snap.section.pref")
+
+                if (need_resp or need_qual or need_pref):
+                    r_,q_,p_ = classify_bullets(_split_bullets(snap))
+                    if need_resp and r_: out["responsibilities"] += r_; need_resp=False; out["used_paths"].append("snap.classifier.resp")
+                    if need_qual and q_: out["qualifications"]   += q_; need_qual=False; out["used_paths"].append("snap.classifier.qual")
+                    if need_pref and p_: out["preferred"]        += p_; need_pref=False; out["used_paths"].append("snap.classifier.pref")
+
+        # 5) <li> 폴백
+        need_resp = not out["responsibilities"]
+        need_qual = not out["qualifications"]
+        need_pref = not out["preferred"]
+        if (need_resp or need_qual or need_pref):
+            try:
+                soup2 = BeautifulSoup(r.text, "html.parser")
+                lis = [ _clean_text(li.get_text(" ")) for li in soup2.find_all("li") ]
+                r_,q_,p_ = classify_bullets(lis)
+                if need_resp and r_: out["responsibilities"] += r_; out["used_paths"].append("li.resp")
+                if need_qual and q_: out["qualifications"]   += q_; out["used_paths"].append("li.qual")
+                if need_pref and p_: out["preferred"]        += p_; out["used_paths"].append("li.pref")
+            except Exception:
+                pass
+
+        # dedup
         def dedup(xs):
             seen, out2 = set(), []
             for x in xs:
@@ -521,7 +519,7 @@ for k,v in defaults.items():
 def build_company(name: str, home: str|None, role: str|None, job_url: str|None) -> dict:
     site = fetch_site_snippets(home) if home else {"values":[], "recent":[], "about":None}
     urls = [job_url] if job_url else discover_job_urls(name, role or "", home, limit=5)
-    jp = parse_job_posting(urls[0]) if urls else {"title":None,"responsibilities":[],"qualifications":[],"preferred":[],"company_intro":None}
+    jp = parse_job_posting(urls[0]) if urls else {"title":None,"responsibilities":[],"qualifications":[],"preferred":[],"company_intro":None,"used_paths":[]}
     news = naver_search_news(name, display=6) or []
     return {
         "company_name": name.strip() or "(회사명 미설정)",
@@ -535,6 +533,7 @@ def build_company(name: str, home: str|None, role: str|None, job_url: str|None) 
         "role_responsibilities": jp.get("responsibilities", []),
         "role_qualifications":   jp.get("qualifications", []),
         "role_preferred":        jp.get("preferred", []),
+        "used_paths":            jp.get("used_paths", []),
         "news": news
     }
 
@@ -560,7 +559,6 @@ if st.button("회사/직무 정보 불러오기", type="primary"):
             cobj = build_company(company_name, homepage or None, role_title or None, job_url_in or None)
             intro = summarize_intro_only(cobj)
             st.session_state.company_state={"company":cobj, "intro":intro}
-            # 하단 초기화
             st.session_state.current_question=""
             st.session_state.answer_text=""
             st.session_state.history=[]
@@ -604,6 +602,7 @@ if company and intro:
             "resp_cnt": len(company.get("role_responsibilities") or []),
             "qual_cnt": len(company.get("role_qualifications") or []),
             "pref_cnt": len(company.get("role_preferred") or []),
+            "used_paths": company.get("used_paths", [])
         })
 else:
     st.info("위 입력 후 ‘회사/직무 정보 불러오기’를 눌러 주세요.")
@@ -753,7 +752,7 @@ def detect_axes_from_question(q: str) -> list[bool]:
         pats=KEYMAP[axis]
         if any(re.search(p, ql, re.I) for p in pats):
             applies[i]=True
-    if sum(applies)==0: applies=[True,False,False,False,True]  # 최소 보장
+    if sum(applies)==0: applies=[True,False,False,False,True]
     return applies
 
 def coach(company: dict|None, question: str, answer: str, supports, qtype: str) -> dict:
@@ -780,18 +779,16 @@ def coach(company: dict|None, question: str, answer: str, supports, qtype: str) 
     # 역량 파싱
     last = content.splitlines()[-1]
     toks = [t.strip() for t in re.split(r"[,\s]+", last) if t.strip()!=""]
-    comps: list[Optional[int]]=[]
+    comps=[]
     for t in toks[:5]:
         if t in ["-","–","—"]: comps.append(None)
         elif re.fullmatch(r"\d{1,2}", t): comps.append(max(0,min(20,int(t))))
         else: comps.append(None)
     while len(comps)<5: comps.append(None)
 
-    # 총점(우리 계산): 적용축 평균 ×5
     used=[v for v,a in zip(comps, applies) if a and isinstance(v,int)]
     score = round(sum(used)/len(used)*5) if used else 0
 
-    # 본문 내 총점 라인 교체
     lines=content.splitlines(); repl=False
     for i,L in enumerate(lines[:3]):
         if "총점" in L:
@@ -891,4 +888,4 @@ rep = build_report(st.session_state.history)
 st.download_button("CSV 다운로드", data=rep.to_csv(index=False).encode("utf-8-sig"),
                    file_name="interview_session_report.csv", mime="text/csv")
 
-st.caption("속도 최적화: 상세 URL 우선 선택, HTTP 캐시, '회사 소개만' 요약(토큰 절감), RAG 조건부 실행")
+st.caption("포털 화이트리스트 → 상세 URL 우선 → 섹션별 충전 로직 → 스냅샷 폴백으로 자격/우대 누락 최소화")
