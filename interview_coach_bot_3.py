@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # 파일명 예: interview_job_fulltext_app.py
 
-import os, re, io, json, html, textwrap, urllib.parse, time, random
+import os, re, io, json, html, textwrap, urllib.parse
 from typing import Tuple, Dict, List, Optional
 
 import streamlit as st
@@ -15,10 +15,11 @@ try:
 except Exception:
     LC_OK = False
 
-# =============== 페이지 설정
-st.set_page_config(page_title="회사 요약 / 채용 요건 - 원문 수집기", page_icon="🧲", layout="wide")
+# =========================
+# Page / Secrets
+# =========================
+st.set_page_config(page_title="회사 요약 · 채용 요건 원문 수집/요약", page_icon="🧲", layout="wide")
 
-# =============== 시크릿/키 로드
 def _get(key: str) -> Optional[str]:
     v = os.getenv(key)
     if v: return v
@@ -31,7 +32,9 @@ OPENAI_API_KEY = _get("OPENAI_API_KEY")
 NAVER_ID        = _get("NAVER_CLIENT_ID")
 NAVER_SECRET    = _get("NAVER_CLIENT_SECRET")
 
-# =============== 유틸
+# =========================
+# Utils
+# =========================
 def _clean(s: str) -> str:
     if not s: return ""
     s = html.unescape(s)
@@ -43,14 +46,15 @@ def _abs(url: str) -> str:
     if not u.startswith("http"): u = "https://" + u
     return u
 
-# =============== 포털 전용 수집기 (접힘/더보기 포함)
+# =========================
+# Portal-specific collectors
+# =========================
 def wanted_full_text(url: str) -> Tuple[str, Dict]:
-    """
-    원티드 상세(/wd/<id>)의 펼쳐진 본문까지 JSON API로 직접 긁음.
-    """
+    """원티드 상세(/wd/<id>)의 펼쳐진 본문을 JSON API로 수집."""
     m = re.search(r"/wd/(\d+)", url)
     if not m:
-        return "", {"wanted":"no_id"}
+        return "", {"wanted": "no_id"}
+
     jid = m.group(1)
     endpoints = [
         f"https://www.wanted.co.kr/api/v4/jobs/{jid}?locale=ko-KR",
@@ -91,10 +95,12 @@ def wanted_full_text(url: str) -> Tuple[str, Dict]:
                 elif isinstance(obj, list):
                     for it in obj: walk(it)
             walk(data)
+
             if not texts:
                 blob = json.dumps(data, ensure_ascii=False)
                 cand = re.findall(r'["\'](?:detail|description|qualification|prefer|requirements)["\']\s*:\s*"(.*?)"', blob, flags=re.S)
                 texts += [_clean(x) for x in cand]
+
             if texts:
                 return "\n\n".join(dict.fromkeys(texts)), {"source":"wanted+json","url_final":url}
         except Exception:
@@ -102,9 +108,7 @@ def wanted_full_text(url: str) -> Tuple[str, Dict]:
     return "", {"wanted":"fail"}
 
 def saramin_full_text(url: str) -> Tuple[str, Dict]:
-    """
-    사람인 상세(SSR + 일부 접힘). 대표 컨테이너들을 모아 원문 텍스트 조립.
-    """
+    """사람인 상세(SSR + 일부 접힘). 대표 컨테이너 모아 원문 조립."""
     if "saramin.co.kr" not in url:
         return "", {"saramin":"skip"}
     try:
@@ -136,9 +140,7 @@ def saramin_full_text(url: str) -> Tuple[str, Dict]:
     return "", {"saramin":"fail"}
 
 def jobkorea_full_text(url: str) -> Tuple[str, Dict]:
-    """
-    잡코리아 상세(SSR). 대표 컨테이너 수집.
-    """
+    """잡코리아 상세(SSR). 대표 컨테이너 수집."""
     if "jobkorea.co.kr" not in url:
         return "", {"jobkorea":"skip"}
     try:
@@ -156,24 +158,26 @@ def jobkorea_full_text(url: str) -> Tuple[str, Dict]:
         pass
     return "", {"jobkorea":"fail"}
 
-# =============== Jina / WebBase / BS4 폴백
+# =========================
+# Generic loaders (Jina → WebBase → BS4)
+# =========================
 def get_full_page_text(url: str) -> Tuple[str, Dict]:
     u = _abs(url)
     meta = {"url_final": u}
 
     # 1) 포털 전용
     if "wanted.co.kr/wd/" in u:
-        t, m = wanted_full_text(u)
+        t, _ = wanted_full_text(u)
         if t:
             meta.update({"source":"wanted+raw","lens":{"jina":0,"webbase":len(t),"bs4":len(t)}})
             return t, meta
     if "saramin.co.kr" in u:
-        t, m = saramin_full_text(u)
+        t, _ = saramin_full_text(u)
         if t:
             meta.update({"source":"saramin+raw","lens":{"jina":0,"webbase":len(t),"bs4":len(t)}})
             return t, meta
     if "jobkorea.co.kr" in u:
-        t, m = jobkorea_full_text(u)
+        t, _ = jobkorea_full_text(u)
         if t:
             meta.update({"source":"jobkorea+raw","lens":{"jina":0,"webbase":len(t),"bs4":len(t)}})
             return t, meta
@@ -216,7 +220,9 @@ def get_full_page_text(url: str) -> Tuple[str, Dict]:
     meta.update({"source":"none","lens":{"jina":0,"webbase":0,"bs4":0}})
     return "", meta
 
-# =============== 검색(선택): 네이버 웹 → DuckDuckGo 폴백
+# =========================
+# Search (Naver → DuckDuckGo)
+# =========================
 JOB_SITES = ["wanted.co.kr","saramin.co.kr","jobkorea.co.kr","rocketpunch.com","linkedin.com","indeed.com"]
 
 def naver_search_web(query: str, display: int = 5) -> List[str]:
@@ -260,13 +266,11 @@ def discover_job_url(company: str, role: str, limit: int = 6) -> List[str]:
     site_part = " OR ".join([f"site:{s}" for s in JOB_SITES])
     q2 = f"{company} {role} ({site_part})"
     urls=[]
-    # 네이버 우선
     if NAVER_ID and NAVER_SECRET:
         urls += naver_search_web(q1, display=6)
         urls += naver_search_web(q2, display=6)
     if not urls:
         urls += duckduck_search(q2, display=10)
-    # 정제
     seen=set(); out=[]
     for u in urls:
         try:
@@ -278,7 +282,9 @@ def discover_job_url(company: str, role: str, limit: int = 6) -> List[str]:
         if len(out)>=limit: break
     return out
 
-# =============== OpenAI (요약) – 선택
+# =========================
+# OpenAI summarizer (optional)
+# =========================
 OPENAI_READY = False
 if OPENAI_API_KEY:
     try:
@@ -289,10 +295,7 @@ if OPENAI_API_KEY:
         OPENAI_READY = False
 
 def llm_summarize_sections(raw_text: str, company: str) -> Dict[str, List[str] | str]:
-    """
-    원문에서 회사 소개/주요업무/자격요건/우대사항을 '요약'으로 뽑음.
-    포털마다 섹션명이 다양하므로 LLM 요약이 가장 견고.
-    """
+    """원문에서 회사소개/주요업무/자격요건/우대사항을 요약으로 생성."""
     if not (OPENAI_READY and raw_text.strip()):
         return {"intro":"", "resp":[], "qual":[], "pref":[]}
     sys = ("너는 채용공고를 읽고 섹션별 핵심을 한국어로 요약하는 도우미다. "
@@ -326,8 +329,10 @@ JSON으로만 답하라. 키는 intro(resp/qual/pref)이며 resp/qual/pref는 �
     except Exception:
         return {"intro":"","resp":[],"qual":[],"pref":[]}
 
-# =============== UI
-st.title("🧲 회사 요약 / 채용 요건 (원문 수집 + 요약)")
+# =========================
+# UI
+# =========================
+st.title("🧲 회사 요약 · 채용 요건 (원문 수집 + 요약)")
 
 with st.sidebar:
     st.header("입력")
@@ -355,7 +360,7 @@ if btn_go:
     if not chosen:
         st.warning("공고 URL을 찾지 못했습니다. URL을 직접 입력해 주세요.")
     else:
-        with st.spinner("원문 수집 중…(포털 전용 수집기 → Jina → WebBase → BS4)"):
+        with st.spinner("원문 수집 중…(포털 전용 → Jina → WebBase → BS4)"):
             txt, meta = get_full_page_text(chosen)
             st.session_state.raw_job_text  = txt
             st.session_state.job_url_final = meta.get("url_final") or chosen
@@ -365,7 +370,7 @@ if btn_go:
         else:
             st.success("원문 수집 완료!")
 
-# =============== 표시: 원문 전체
+# 표시: 원문 전체
 if st.session_state.raw_job_text:
     st.info("아래는 채용 상세 페이지에서 추출한 **원문 전체 텍스트**입니다. (접힘 포함, 가능한 한 모두)")
 else:
@@ -385,7 +390,7 @@ with c2:
                        data=st.session_state.raw_job_text.encode("utf-8-sig"),
                        file_name="job_requirements_fulltext.txt", use_container_width=True)
 
-# =============== 표시: 요약 섹션(LLM)
+# 표시: 요약 섹션
 st.divider()
 st.subheader("요약 섹션 (회사 소개 / 주요업무 / 자격요건 / 우대사항)")
 
@@ -417,7 +422,7 @@ else:
     else:
         st.info("먼저 원문을 수집하세요.")
 
-# =============== 디버그: 경로/상태
+# 디버그: 경로/상태
 st.divider()
 with st.expander("디버그: 원문 수집 경로/상태"):
     st.write({
@@ -427,7 +432,7 @@ with st.expander("디버그: 원문 수집 경로/상태"):
     })
     st.caption("source가 wanted+raw/saramin+raw/jobkorea+raw면 포털 전용 수집기가 동작하여 접힌 본문까지 포함합니다.")
 
-# =============== 자가진단: 직접 URL 테스트
+# 자가진단: 직접 URL 테스트
 st.divider()
 with st.expander("🧪 원문 테스트(직접 URL)"):
     test_url = st.text_input("테스트할 채용 상세 URL을 입력하세요", key="test_url")
