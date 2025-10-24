@@ -800,3 +800,15 @@ st.download_button("CSV 다운로드", data=rep.to_csv(index=False).encode("utf-
                    file_name="interview_session_report.csv", mime="text/csv")
 
 st.caption("※ ② 섹션은 요청에 따라 공고 페이지의 텍스트를 **그대로** 노출합니다(Jina 1순위, 실패 시 WebBase→BS4).")
+
+st.divider()
+with st.expander("🧪 원문 테스트(직접 URL)"):
+    test_url = st.text_input("테스트할 채용 상세 URL을 입력하세요")
+    if st.button("테스트 실행"):
+        if not test_url.strip():
+            st.warning("URL을 입력하세요.")
+        else:
+            txt, meta = get_full_page_text(test_url.strip())
+            st.write(meta)
+            st.write(f"텍스트 길이: {len(txt)}")
+            st.text_area("미리보기(앞 3000자)", value=txt[:3000], height=300)
