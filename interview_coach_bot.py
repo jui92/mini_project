@@ -60,7 +60,7 @@ def load_naver_keys():
     return cid, csec
 
 NAVER_ID, NAVER_SECRET = load_naver_keys()
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
 
 # ------------------------------ Text utils ------------------------------
 def _clean_text(t: str) -> str:
@@ -211,6 +211,7 @@ def discover_job_posting_urls(company_name: str, role: str, homepage: str|None, 
     return urls[:limit]
 
 def _first_detail_from_list(url: str, role_hint: str = "") -> Optional[str]:
+    """리스트 페이지일 경우 첫 상세 공고로 들어가도록 시도"""
     try:
         r = requests.get(url, timeout=10, headers=UA)
         if r.status_code != 200 or "text/html" not in r.headers.get("content-type",""):
@@ -246,18 +247,27 @@ def ensure_detail_url(u: str, role_hint: str) -> str:
     deep = _first_detail_from_list(u, role_hint)
     return deep or u
 
-# ------------------------------ 채용 텍스트 수집 + LLM 요약 ------------------------------
+# ------------------------------ 채용 텍스트 수집 + 요약 파이프라인 ------------------------------
 def fetch_page_text(url: str, max_chars: int = 16000) -> str:
     try:
         r = requests.get(url, timeout=12, headers=UA)
         if r.status_code != 200 or "text/html" not in r.headers.get("content-type",""): return ""
         soup = BeautifulSoup(r.text, "html.parser")
-        # remove script/style
         for s in soup(["script","style","noscript"]): s.decompose()
         text = _clean_text(soup.get_text(" "))
         return text[:max_chars]
     except Exception:
         return ""
+
+def _extract_json_block(text: str) -> Optional[str]:
+    """코드블록/텍스트 속 JSON만 안전 추출"""
+    # ```json {...} ``` 처리
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.S)
+    if m: return m.group(1)
+    # 일반 { ... }
+    m = re.search(r"\{.*\}", text, re.S)
+    if m: return m.group(0)
+    return None
 
 def llm_summarize_job_sections(client: OpenAI, model: str, raw_text: str) -> dict:
     """
@@ -266,21 +276,22 @@ def llm_summarize_job_sections(client: OpenAI, model: str, raw_text: str) -> dic
     """
     if not raw_text.strip():
         return {"responsibilities":[], "qualifications":[], "preferences":[]}
-    sys = ("너는 채용 공고 전문을 분석해 아래 세 섹션을 한국어 불릿으로 **요약**한다. "
-           "각 항목은 최대 12개, 문장은 간결하게. "
-           "반드시 JSON만 출력: "
-           "{\"responsibilities\":[], \"qualifications\":[], \"preferences\":[]}")
+    sys = (
+        "너는 채용 공고 전문을 분석해 아래 세 섹션을 한국어 불릿으로 **요약**한다. "
+        "각 항목은 최대 12개, 문장은 간결하게. "
+        "반드시 JSON만 출력: "
+        '{"responsibilities":[], "qualifications":[], "preferences":[]}'
+    )
     user = f"다음은 채용공고 원문이다. 요약 결과만 JSON으로 반환하라.\n\n<<<원문>>>\n{raw_text}\n<<<끝>>>"
     try:
         resp = client.chat.completions.create(
-            model=model, temperature=0.2,
+            model=model, temperature=0.2, max_tokens=800,
             messages=[{"role":"system","content":sys},{"role":"user","content":user}]
         )
         content = resp.choices[0].message.content.strip()
-        # JSON만 추출
-        m = re.search(r"\{.*\}", content, re.S)
-        if m:
-            data = json.loads(m.group(0))
+        jb = _extract_json_block(content) or ""
+        if jb:
+            data = json.loads(jb)
             def _norm(arr):
                 return [_clean_text(x)[:300] for x in (arr or []) if _clean_text(x)]
             return {
@@ -290,11 +301,50 @@ def llm_summarize_job_sections(client: OpenAI, model: str, raw_text: str) -> dic
             }
     except Exception:
         pass
-    # 완전 폴백: 단순 문장 분리
-    parts = [x.strip(" -•·▪︎—") for x in re.split(r"[•\n\r\t]+", raw_text)]
-    parts = [p for p in parts if 5 < len(p) < 220][:24]
-    n = len(parts); k = n//3 if n>=9 else max(3, n//3 or 1)
-    return {"responsibilities":parts[:k], "qualifications":parts[k:2*k], "preferences":parts[2*k:2*k+k]}
+    return {"responsibilities":[], "qualifications":[], "preferences":[]}
+
+# ---- 휴리스틱 분해(헤더 키워드 기반) ----
+HEAD_KEYS = {
+    "resp": ["주요 업무","담당 업무","업무","responsibilities","what you will do","role"],
+    "qual": ["자격 요건","지원 자격","요건","requirements","qualifications","must have"],
+    "pref": ["우대","가산점","preferred","nice to have","우대사항"],
+}
+def heuristic_split_sections(raw: str) -> dict:
+    s = raw
+    # 헤더를 기준으로 블록 단위 나누기
+    blocks = []
+    for m in re.finditer(r"(?:^|\n)([^:\n]{2,40})\s*[:：]\s*(.+?)(?=\n[^:\n]{2,40}\s*[:：]|\Z)", s, re.S | re.I):
+        head = _clean_text(m.group(1))
+        body = _clean_text(m.group(2))
+        if len(body) < 20: continue
+        blocks.append((head, body))
+
+    def collect(keys):
+        for h, b in blocks:
+            if any(k.lower() in h.lower() for k in keys):
+                items = [x.strip(" -•·▪︎—") for x in re.split(r"[•\-\n\r;·▪︎—]+", b)]
+                return [x for x in items if 5 < len(x) <= 220][:12]
+        return []
+
+    return {
+        "responsibilities": collect(HEAD_KEYS["resp"]),
+        "qualifications":   collect(HEAD_KEYS["qual"]),
+        "preferences":      collect(HEAD_KEYS["pref"]),
+    }
+
+# ---- 문장 나눔 폴백 ----
+def naive_split_sections(raw: str) -> dict:
+    parts = [x.strip(" -•·▪︎—") for x in re.split(r"[•\n\r\t;·▪︎—]+", raw)]
+    parts = [p for p in parts if 5 < len(p) < 220][:30]
+    n = len(parts)
+    if n == 0:
+        return {"responsibilities":[], "qualifications":[], "preferences":[]}
+    k = max(3, n // 3)
+    return {
+        "responsibilities": parts[:k],
+        "qualifications": parts[k:2*k],
+        "preferences": parts[2*k:2*k+k],
+    }
 
 # ------------------------------ 회사/요약 생성 ------------------------------
 def fetch_site_snippets(base_url: str | None, company_name_hint: str | None = None) -> dict:
@@ -307,14 +357,12 @@ def fetch_site_snippets(base_url: str | None, company_name_hint: str | None = No
         if r.status_code != 200 or "text/html" not in r.headers.get("content-type",""):
             return {"values": [], "recent": [], "site_name": None, "about": None}
         soup = BeautifulSoup(r.text, "html.parser")
-        # site name
         site_name = None
         og = soup.find("meta", {"property":"og:site_name"}) or soup.find("meta", {"name":"application-name"})
         if og and og.get("content"): site_name = _clean_text(og["content"])
         elif soup.title and soup.title.string: site_name = _clean_text(soup.title.string.split("|")[0])
-        # about 후보
-        ps = " ".join([_clean_text(p.get_text(" ")) for p in soup.find_all("p")[:5]])
-        about = _clean_text(ps)[:400] if ps else None
+        ps = " ".join([_clean_text(p.get_text(" ")) for p in soup.find_all("p")[:6]])
+        about = _clean_text(ps)[:500] if ps else None
         return {"values": [], "recent": [], "site_name": site_name, "about": about}
     except Exception:
         return {"values": [], "recent": [], "site_name": None, "about": None}
@@ -324,7 +372,7 @@ def generate_company_intro_only(client: OpenAI, model: str, company_name: str, a
     sys = "너는 채용담당자다. 다음 텍스트를 바탕으로 **회사 소개만** 한국어 2~3문장으로 요약하라. 추측/과장은 금지."
     user = f"[회사명] {company_name}\n[텍스트]\n{base[:1200]}"
     try:
-        resp = client.chat.completions.create(model=model, temperature=0.3,
+        resp = client.chat.completions.create(model=model, temperature=0.3, max_tokens=220,
                                              messages=[{"role":"system","content":sys},{"role":"user","content":user}])
         return resp.choices[0].message.content.strip()
     except Exception:
@@ -363,25 +411,60 @@ if "company_state" not in st.session_state:
 if "answer_text" not in st.session_state:
     st.session_state.answer_text = ""
 
+def summarize_from_urls(urls: List[str], role_hint: str) -> Tuple[dict, dict]:
+    """여러 URL을 순회하며 텍스트 수집→LLM→휴리스틱→폴백까지 진행. 최초 성공 결과 반환."""
+    debug = {"tried": [], "used_url": None, "raw_len": 0, "stage": None,
+             "resp_cnt": 0, "qual_cnt": 0, "pref_cnt": 0}
+    for u in urls:
+        if not u: continue
+        u = ensure_detail_url(u, role_hint)
+        debug["tried"].append(u)
+        raw = fetch_page_text(u, max_chars=16000)
+        debug["raw_len"] = len(raw)
+        if not raw:
+            continue
+
+        # 1) LLM 요약
+        parsed = llm_summarize_job_sections(client, MODEL, raw)
+        if any([parsed["responsibilities"], parsed["qualifications"], parsed["preferences"]]):
+            debug.update({"used_url": u, "stage": "llm"})
+            debug["resp_cnt"] = len(parsed["responsibilities"])
+            debug["qual_cnt"] = len(parsed["qualifications"])
+            debug["pref_cnt"] = len(parsed["preferences"])
+            return parsed, debug
+
+        # 2) 휴리스틱
+        parsed = heuristic_split_sections(raw)
+        if any([parsed["responsibilities"], parsed["qualifications"], parsed["preferences"]]):
+            debug.update({"used_url": u, "stage": "heuristic"})
+            debug["resp_cnt"] = len(parsed["responsibilities"])
+            debug["qual_cnt"] = len(parsed["qualifications"])
+            debug["pref_cnt"] = len(parsed["preferences"])
+            return parsed, debug
+
+        # 3) 폴백
+        parsed = naive_split_sections(raw)
+        if any([parsed["responsibilities"], parsed["qualifications"], parsed["preferences"]]):
+            debug.update({"used_url": u, "stage": "naive"})
+            debug["resp_cnt"] = len(parsed["responsibilities"])
+            debug["qual_cnt"] = len(parsed["qualifications"])
+            debug["pref_cnt"] = len(parsed["preferences"])
+            return parsed, debug
+
+    return {"responsibilities":[], "qualifications":[], "preferences":[]}, debug
+
 def build_company_obj(name: str, homepage: str|None, role: str|None, job_url: str|None) -> dict:
     site = fetch_site_snippets(homepage or None, name)
 
-    # 1) 공고 URL 결정
-    candidates = [job_url] if job_url else discover_job_posting_urls(name, role or "", homepage, limit=4)
-    job_detail = None
-    if candidates:
-        job_detail = ensure_detail_url(candidates[0], role or "")
+    # 후보 URL 구성: 입력 → 홈페이지 탐색 → 포털 검색
+    candidates = []
+    if job_url: candidates.append(job_url)
+    else:
+        candidates += discover_job_posting_urls(name, role or "", homepage, limit=5)
+    # 후보가 없더라도 빈 리스트 그대로 전달(LLM 요약은 못하지만 화면은 안내)
 
-    # 2) 공고 텍스트 → LLM 요약으로 3섹션 만들기
-    resp_list, qual_list, pref_list = [], [], []
-    raw_len = 0
-    if job_detail:
-        raw = fetch_page_text(job_detail, max_chars=16000)
-        raw_len = len(raw)
-        parsed = llm_summarize_job_sections(client, MODEL, raw)
-        resp_list, qual_list, pref_list = parsed["responsibilities"], parsed["qualifications"], parsed["preferences"]
+    parsed, dbg = summarize_from_urls(candidates, role or "")
 
-    # 3) 뉴스
     news_items = naver_search_news(name, display=6, sort="date")
 
     return {
@@ -389,13 +472,12 @@ def build_company_obj(name: str, homepage: str|None, role: str|None, job_url: st
         "homepage": homepage or None,
         "company_intro_site": site.get("about"),
         "role": role or "",
-        "role_requirements": resp_list,
-        "role_qualifications": qual_list,
-        "preferences": pref_list,
-        "job_url": job_detail or (candidates[0] if candidates else (job_url or None)),
+        "role_requirements": parsed["responsibilities"],
+        "role_qualifications": parsed["qualifications"],
+        "preferences": parsed["preferences"],
+        "job_url": dbg.get("used_url") or (candidates[0] if candidates else (job_url or None)),
         "news": news_items,
-        "_debug": {"job_url": job_detail, "raw_len": raw_len,
-                   "resp_cnt": len(resp_list), "qual_cnt": len(qual_list), "pref_cnt": len(pref_list)}
+        "_debug": dbg
     }
 
 def build_company_summary_md(c: dict) -> str:
@@ -429,7 +511,7 @@ company = st.session_state.get("company_state",{}).get("company", {
 summary_md = st.session_state.get("company_state",{}).get("summary_md", None)
 
 # ==========================================================
-# ② 회사 요약 / 채용 요건 (LLM 요약 — 세로 스택)
+# ② 회사 요약 / 채용 요건 (세로 스택)
 # ==========================================================
 st.subheader("② 회사 요약 / 채용 요건")
 if summary_md:
@@ -604,7 +686,7 @@ if st.button("새 질문 받기", use_container_width=True, type="primary"):
 st.text_area("질문", height=110, value=st.session_state.get("current_question",""))
 
 # ==========================================================
-# ④ 나의 답변 / 코칭 (100점제) — 기존 로직 유지
+# ④ 나의 답변 / 코칭 (100점제)
 # ==========================================================
 st.subheader("④ 나의 답변 / 코칭")
 
@@ -723,4 +805,4 @@ rep = build_report(st.session_state.history)
 st.download_button("CSV 다운로드", data=rep.to_csv(index=False).encode("utf-8-sig"),
                    file_name="interview_session_report.csv", mime="text/csv")
 
-st.caption("지금은 ‘원문 그대로 가져오기’ 대신 페이지 전체를 분석해 요약합니다. 공고 URL이 없어도 자동 탐색한 URL에서 요약을 시도합니다.")
+st.caption("원문 파싱 실패시에도 LLM/휴리스틱/폴백 3단계로 요약을 보장합니다. 리스트 페이지면 상세 공고로 자동 진입합니다.")
