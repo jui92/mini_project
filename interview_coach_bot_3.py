@@ -290,8 +290,8 @@ except Exception:
 # Playwright URL Loader (선택) - 설치 필요
 USE_PLAYWRIGHT = False
 try:
-    # from langchain.document_loaders import PlaywrightURLLoader # langchain 버전 따라 위치 다름
-    from langchain.document_loaders import PlaywrightURLLoader
+    from langchain.document_loaders import PlaywrightURLLoader 
+    #from langchain.document_loaders import PlaywrightURLLoader
     PLAYWRIGHT_OK = True
 except Exception:
     PLAYWRIGHT_OK = False
