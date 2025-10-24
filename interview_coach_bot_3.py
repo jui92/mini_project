@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 # interview_coach_bot.py
-# v4.0 — 채용 상세 URL 정규화 + WebBaseLoader→BS4→Jina 3단 폴백으로
-#        페이지의 "모든 텍스트"를 그대로 ② 회사 요약/채용 요건에 출력
-#        질문 생성/채점/레이더/CSV 유지 및 총점 일원화, 디버그 패널 추가
+# v4.1 — 프리렌더(Jina) 1순위 + 포털 전용 수집기 + 3단 폴백으로 원문 전체 확보
+#        ② 섹션은 페이지 원문을 그대로 출력(요약/파싱X), 디버그 패널 포함
+#        질문 생성/채점(5기준×20=100), 레이더(최신/평균), CSV 유지
 
 import os, io, re, json, textwrap, urllib.parse, difflib, random, time
 from typing import List, Dict, Tuple, Optional
@@ -75,9 +75,11 @@ def load_naver_keys():
 NAVER_ID, NAVER_SECRET = load_naver_keys()
 
 UA = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124 Safari/537.36",
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124 Safari/537.36"),
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 # =========================================================
@@ -272,7 +274,7 @@ def discover_job_posting_urls(company: str, role: str, homepage: str|None, limit
     urls = resolved[:]
     if urls: return urls[:limit]
 
-    # 포털 검색
+    # 포털 검색 (네이버 우선)
     if NAVER_ID and NAVER_SECRET:
         for dom in JOB_SITES:
             if len(urls)>=limit: break
@@ -286,7 +288,7 @@ def discover_job_posting_urls(company: str, role: str, homepage: str|None, limit
                     urls.append(normalize_job_url(lk))
                 if len(urls)>=limit: break
     else:
-        # DuckDuckGo 폴백 (간단)
+        # DuckDuckGo 폴백
         site_part = " OR ".join([f'site:{d}' for d in JOB_SITES])
         q = f'{company} {role} ({site_part})' if role else f'{company} 채용 ({site_part})'
         url = "https://duckduckgo.com/html/?q=" + urllib.parse.quote(q)
@@ -308,64 +310,149 @@ def discover_job_posting_urls(company: str, role: str, homepage: str|None, limit
     return urls[:limit]
 
 # =========================================================
-# 원문 전체 텍스트 로더 (핵심) — WebBase → BS4 → Jina
+# 원문 전체 텍스트 로더 — 포털 전용 + Jina 1순위 + 3단 폴백
 # =========================================================
-@st.cache_data(ttl=1800, show_spinner=False)
-def webbase_dump_all_text(url: str) -> str:
-    if not WEBBASE_OK or not url:
-        return ""
-    try:
-        loader = WebBaseLoader(url)
-        docs = loader.load()
-        return "\n\n".join([getattr(d, "page_content", "") for d in docs if getattr(d, "page_content", "")])
-    except Exception:
-        return ""
+def _clean_linespace(t: str) -> str:
+    return re.sub(r"\s+\n", "\n", re.sub(r"[ \t]+", " ", t or "")).strip()
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def bs4_dump_all_text(url: str) -> str:
-    try:
-        r = requests.get(url, timeout=12, headers=UA)
-        if r.status_code != 200 or "text/html" not in r.headers.get("content-type",""):
-            return ""
-        soup = BeautifulSoup(r.text, "html.parser")
-        for tag in soup(["script","style","noscript"]): tag.decompose()
-        text = soup.get_text(separator="\n", strip=True)
-        return re.sub(r"\n{3,}", "\n\n", text)
-    except Exception:
-        return ""
+def fetch_raw(url: str) -> dict:
+    """동일 URL에 대해 3단계 모두 시도하고 결과/길이를 반환."""
+    out = {"webbase": "", "bs4": "", "jina": ""}
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def jina_reader_text(url: str) -> str:
+    # 1) WebBaseLoader
+    if WEBBASE_OK:
+        try:
+            wb = WebBaseLoader(url)
+            docs = wb.load()
+            out["webbase"] = "\n\n".join([getattr(d, "page_content", "") for d in docs if getattr(d, "page_content", "")])
+        except Exception:
+            pass
+
+    # 2) BeautifulSoup (정적)
+    try:
+        r = requests.get(url, headers=UA, timeout=18)
+        if r.status_code == 200 and "text/html" in r.headers.get("content-type",""):
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup(["script","style","noscript"]): tag.decompose()
+            txt = soup.get_text("\n", strip=True)
+            out["bs4"] = _clean_linespace(re.sub(r"\n{3,}", "\n\n", txt))
+    except Exception:
+        pass
+
+    # 3) Jina Reader (프리렌더) — 1순위로 쓰기 위해 여기서도 가져오지만 최종 선택은 아래에서
     try:
         proxied = "https://r.jina.ai/http/" + url
-        r = requests.get(proxied, timeout=20, headers=UA)
-        if r.status_code != 200:
-            return ""
-        txt = r.text.strip()
-        return txt if len(txt) > 10 else txt
+        r = requests.get(proxied, headers=UA, timeout=25)
+        if r.status_code == 200:
+            out["jina"] = r.text.strip()
     except Exception:
-        return ""
+        pass
+
+    return out
+
+def wanted_text(url: str) -> str:
+    raw = fetch_raw(url)
+    # Jina 우선
+    base = raw.get("jina") or raw.get("webbase") or raw.get("bs4") or ""
+    txt = base
+
+    # JSON-LD JobPosting 보강
+    try:
+        r = requests.get(url, headers=UA, timeout=18)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "htmlparser") if False else BeautifulSoup(r.text, "html.parser")
+            for s in soup.find_all("script", type="application/ld+json"):
+                try:
+                    data = json.loads(s.string or "")
+                    seq = data if isinstance(data, list) else [data]
+                    for obj in seq:
+                        t = obj.get("@type")
+                        if (isinstance(t, list) and "JobPosting" in t) or t == "JobPosting":
+                            desc = obj.get("description") or ""
+                            if desc:
+                                add = _clean_linespace(BeautifulSoup(desc, "html.parser").get_text("\n", strip=True))
+                                if len(add) > 50:
+                                    txt = (txt + "\n\n" + add).strip()
+                                    return txt
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return txt
+
+def saramin_text(url: str) -> str:
+    raw = fetch_raw(url)
+    base = raw.get("jina") or raw.get("webbase") or raw.get("bs4") or ""
+    txt = base
+    try:
+        r = requests.get(url, headers=UA, timeout=18)
+        if r.status_code == 200 and "text/html" in r.headers.get("content-type",""):
+            soup = BeautifulSoup(r.text, "html.parser")
+            picks = []
+            for sel in ["div.wrap_jv_cont", "div.jv_cont", "div.job_cont", "section#content", "div#content", "div#container"]:
+                for x in soup.select(sel):
+                    picks.append(_clean_linespace(x.get_text("\n", strip=True)))
+            if picks:
+                extra = "\n\n".join([p for p in picks if len(p) > 100])
+                if extra and len(extra) > len(txt) // 2:
+                    txt = (txt + "\n\n" + extra).strip()
+    except Exception:
+        pass
+    return txt
+
+def jobkorea_text(url: str) -> str:
+    raw = fetch_raw(url)
+    base = raw.get("jina") or raw.get("webbase") or raw.get("bs4") or ""
+    txt = base
+    try:
+        r = requests.get(url, headers=UA, timeout=18)
+        if r.status_code == 200 and "text/html" in r.headers.get("content-type",""):
+            soup = BeautifulSoup(r.text, "html.parser")
+            picks = []
+            for sel in ["div.detailArea", "div.recruitMent", "div#container", "section#container"]:
+                for x in soup.select(sel):
+                    picks.append(_clean_linespace(x.get_text("\n", strip=True)))
+            if picks:
+                extra = "\n\n".join([p for p in picks if len(p) > 100])
+                if extra and len(extra) > len(txt)//2:
+                    txt = (txt + "\n\n" + extra).strip()
+    except Exception:
+        pass
+    return txt
 
 def get_full_page_text(url: str) -> tuple[str, dict]:
-    """최종 텍스트와 디버그 메타를 함께 반환."""
+    """최종 텍스트와 디버그 메타 반환. (Jina 1순위 + 포털 전용 보강)"""
     if not url:
-        return "", {"url_final":"", "webbase_ok":False, "bs4_ok":False, "jina_ok":False, "lens":{}}
+        return "", {"url_final":"", "source":"", "lens":{}}
+
     if url.startswith("//"): url = "https:" + url
-    url = normalize_job_url(url)
+    host = urllib.parse.urlparse(url if url.startswith("http") else "https://"+url).netloc.lower()
 
-    web_txt = webbase_dump_all_text(url)
-    if web_txt and len(web_txt.strip()) > 50:
-        return web_txt, {"url_final": url, "webbase_ok": True, "bs4_ok": False, "jina_ok": False,
-                         "lens": {"webbase": len(web_txt), "bs4": 0, "jina": 0}}
+    # 포털 전용 수집기
+    if "wanted.co.kr" in host:
+        txt = wanted_text(url)
+        meta = fetch_raw(url); lens = {k: len(meta[k] or "") for k in meta}
+        return txt, {"url_final": url, "source": "wanted+raw", "lens": lens}
 
-    bs4_txt = bs4_dump_all_text(url)
-    if bs4_txt and len(bs4_txt.strip()) > 50:
-        return bs4_txt, {"url_final": url, "webbase_ok": False, "bs4_ok": True, "jina_ok": False,
-                         "lens": {"webbase": len(web_txt or ""), "bs4": len(bs4_txt), "jina": 0}}
+    if "saramin.co.kr" in host:
+        txt = saramin_text(url)
+        meta = fetch_raw(url); lens = {k: len(meta[k] or "") for k in meta}
+        return txt, {"url_final": url, "source": "saramin+raw", "lens": lens}
 
-    jina_txt = jina_reader_text(url)
-    return jina_txt, {"url_final": url, "webbase_ok": bool(web_txt), "bs4_ok": bool(bs4_txt), "jina_ok": bool(jina_txt),
-                      "lens": {"webbase": len(web_txt or ""), "bs4": len(bs4_txt or ""), "jina": len(jina_txt or "")}}
+    if "jobkorea.co.kr" in host:
+        txt = jobkorea_text(url)
+        meta = fetch_raw(url); lens = {k: len(meta[k] or "") for k in meta}
+        return txt, {"url_final": url, "source": "jobkorea+raw", "lens": lens}
+
+    # 일반: Jina → WebBase → BS4 (Jina 1순위)
+    meta = fetch_raw(url)
+    for key in ["jina", "webbase", "bs4"]:
+        if meta.get(key) and len(meta[key]) > 10:
+            lens = {k: len(meta[k] or "") for k in meta}
+            return meta[key], {"url_final": url, "source": key, "lens": lens}
+
+    lens = {k: len(meta[k] or "") for k in meta}
+    return "", {"url_final": url, "source": "none", "lens": lens}
 
 # =========================================================
 # OpenAI
@@ -414,6 +501,7 @@ homepage_input = st.text_input("공식 홈페이지 URL(선택)", placeholder="h
 for k,v in [("company", None), ("answer_text",""), ("history",[]), ("current_question","")]:
     if k not in st.session_state: st.session_state[k]=v
 
+@st.cache_data(show_spinner=True, ttl=900)
 def build_company_obj(name: str, homepage: str|None, role: str|None, job_url: str|None) -> dict:
     news = fetch_news(name, max_items=6)
     # URL 결정
@@ -423,7 +511,7 @@ def build_company_obj(name: str, homepage: str|None, role: str|None, job_url: st
         urls = discover_job_posting_urls(name, role or "", homepage, limit=6)
 
     chosen = urls[0] if urls else None
-    raw_text, dbg = get_full_page_text(chosen) if chosen else ("", {"url_final":"", "webbase_ok":False,"bs4_ok":False,"jina_ok":False,"lens":{}})
+    raw_text, dbg = get_full_page_text(chosen) if chosen else ("", {"url_final":"", "source":"", "lens":{}})
     return {
         "company_name": name.strip() or "(회사명 미설정)",
         "homepage": homepage or None,
@@ -449,7 +537,7 @@ if st.button("회사/직무 정보 불러오기", type="primary"):
 company = st.session_state.get("company")
 
 # =========================================================
-# ② 회사 요약 / 채용 요건  →  “페이지의 모든 텍스트” 그대로 출력
+# ② 회사 요약 / 채용 요건  →  “페이지 원문 전체” 그대로 출력
 # =========================================================
 st.subheader("② 회사 요약 / 채용 요건 (페이지 원문 전체)")
 
@@ -472,11 +560,11 @@ if company:
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("#### 회사 요약 (원문 전체)")
-        st.text_area("회사 요약 원문", value=raw_text, height=500)
+        st.text_area("회사 요약 원문", value=raw_text, height=520)
         st.download_button("회사 요약 원문 다운로드", data=raw_text.encode("utf-8"), file_name="company_summary_raw.txt", mime="text/plain")
     with c2:
         st.markdown("#### 채용 요건 (원문 전체)")
-        st.text_area("채용 요건 원문", value=raw_text, height=500)
+        st.text_area("채용 요건 원문", value=raw_text, height=520)
         st.download_button("채용 요건 원문 다운로드", data=raw_text.encode("utf-8"), file_name="job_requirements_raw.txt", mime="text/plain")
 
     with st.expander("디버그: 원문 수집 경로/상태"):
@@ -711,4 +799,4 @@ rep = build_report(st.session_state.history)
 st.download_button("CSV 다운로드", data=rep.to_csv(index=False).encode("utf-8-sig"),
                    file_name="interview_session_report.csv", mime="text/csv")
 
-st.caption("※ ② 섹션은 요청에 따라 공고 페이지의 텍스트를 **그대로** 노출합니다(WebBaseLoader 우선, 실패 시 BS4 → Jina).")
+st.caption("※ ② 섹션은 요청에 따라 공고 페이지의 텍스트를 **그대로** 노출합니다(Jina 1순위, 실패 시 WebBase→BS4).")
