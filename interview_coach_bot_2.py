@@ -556,34 +556,99 @@ def build_company_obj(name: str, homepage: str|None, role: str|None, job_url: st
     }
 
 def generate_company_summary(c: dict) -> str:
-    # 회사 소개만 요약(주요업무/자격/우대는 원문 그대로 표시)
+    """
+    채용 공고 URL이 없거나 파싱이 실패해도 항상 보기 좋게 요약을 생성.
+    - LLM에게 JSON을 요구 → 파싱 → 마크다운으로 렌더
+    - 원문(홈페이지 about/values/뉴스/직무명/발견된 공고 요약 후보)을 모두 힌트로 줌
+    """
+    # 1) LLM에 줄 원자료(힌트)
     ctx_src = textwrap.dedent(f"""
-    [원자료]
-    - 홈페이지 요약후보: {c.get('company_intro_site') or ''}
+    [원자료(요약 힌트)]
+    - 회사명: {c.get('company_name','')}
+    - 홈페이지 소개문(있으면): {c.get('company_intro_site') or ''}
+    - 핵심가치/키워드: {', '.join(c.get('values', [])[:6])}
+    - 최근 이슈/뉴스: {', '.join([_snippetize(n['title'],70) for n in c.get('news', [])[:4]])}
+    - 모집 분야(직무명): {c.get('role','')}
+    - 공고 추출: 
+      * 주요업무 후보: {', '.join(c.get('role_requirements', [])[:8])}
+      * 자격요건 후보: {', '.join(c.get('role_qualifications', [])[:8])}
     """).strip()
 
-    sys = ("너는 채용담당자다. 아래 원자료를 바탕으로 **회사 소개만** 한국어로 2~3문장 요약하라. "
-           "광고성/수식어를 빼고 사실만 간결히 기술하라. 불확실하면 추측하지 말라.")
-    user = f"{ctx_src}\n\n[회사명] {c.get('company_name','')}"
+    # 2) 시스템 프롬프트(안정 JSON)
+    sys = (
+        "너는 채용담당자다. 입력 힌트를 바탕으로 '채용공고 기준 요약'을 생성한다.\n"
+        "가능하면 후보 텍스트를 재가공하되, 후보가 비어 있어도 상식적으로 직무에 맞는 항목을 보완해 만들어라.\n"
+        "출력은 JSON 한 줄로만 제공한다. 키: \n"
+        "{"
+        "\"company_name\": str, "
+        "\"about\": str(2~3문장), "
+        "\"role\": str, "
+        "\"responsibilities\": list[str](3~7), "
+        "\"qualifications\": list[str](3~7), "
+        "\"preferences\": list[str](0~6)"
+        "}\n"
+        "한국어로 작성. 불필요한 수식어는 최소화."
+    )
+    user = ctx_src
+
+    # 3) LLM 호출 + JSON 파싱
+    data = {
+        "company_name": c.get("company_name",""),
+        "about": c.get("company_intro_site") or "",
+        "role": c.get("role",""),
+        "responsibilities": c.get("role_requirements", [])[:6],
+        "qualifications": c.get("role_qualifications", [])[:6],
+        "preferences": []
+    }
     try:
         resp = client.chat.completions.create(
-            model=MODEL, temperature=0.3,
+            model=MODEL, temperature=0.2,
             messages=[{"role":"system","content":sys},{"role":"user","content":user}]
         )
-        intro = resp.choices[0].message.content.strip()
+        raw = resp.choices[0].message.content.strip()
+        # JSON만 추출 (코드블록/잡텍스트 방어)
+        m = re.search(r'\{.*\}', raw, re.S)
+        if m:
+            cand = json.loads(m.group(0))
+            if isinstance(cand, dict):
+                # 필드별 안전 보정
+                data["company_name"] = cand.get("company_name") or data["company_name"]
+                data["about"] = _clean_text(cand.get("about") or data["about"])
+                data["role"] = cand.get("role") or data["role"]
+                for k in ("responsibilities","qualifications","preferences"):
+                    v = cand.get(k)
+                    if isinstance(v, list) and v:
+                        data[k] = [_snippetize(_clean_text(x), 140) for x in v if _clean_text(x)]
     except Exception:
-        intro = c.get("company_intro_site") or "회사 소개 정보가 충분하지 않습니다."
+        pass
 
-    md = f"""**회사명**  
-{c.get('company_name')}
+    # 후보가 하나도 없을 때 최소 더미 보강
+    if not data["responsibilities"]:
+        data["responsibilities"] = [f"{data['role'] or '해당 직무'} 수행에 필요한 핵심 업무를 주도", "관련 데이터/시스템 운영 및 품질 개선", "협업 부서와 목표/지표 정렬 및 실행"]
+    if not data["qualifications"]:
+        data["qualifications"] = ["관련 분야 실무 경험 또는 동등 역량", "문제정의/지표 설계 역량", "원활한 커뮤니케이션 능력"]
+    # preferences는 없어도 OK
 
-**간단한 회사 소개(요약)**  
-{intro}
+    # 4) 마크다운 렌더
+    md = []
+    md.append("**회사명**  \n" + (data["company_name"] or c.get("company_name","")))
+    about = data["about"] or "회사 소개 요약 정보가 제한적입니다. 입력한 홈페이지/뉴스/키워드 기반으로 추정 요약을 제공합니다."
+    md.append("\n**간단한 회사 소개(요약)**  \n" + about)
+    # 공고 링크가 있으면 버튼
+    if c.get("job_url"):
+        md.append(f"\n[채용 공고 열기]({c['job_url']})")
+    # 세로형 카드 섹션
+    def bullets(title, items):
+        if not items: 
+            md.append(f"\n### {title}\n요약 가능한 {title.replace('(요약)','')}이 없습니다.")
+            return
+        md.append(f"\n### {title}\n" + "\n".join([f"- {it}" for it in items]))
+    bullets("주요업무(요약)", data["responsibilities"])
+    bullets("자격요건(요약)", data["qualifications"])
+    bullets("우대사항(요약)", data.get("preferences", []))
 
-**채용 공고 열기**  
-{"[링크](" + c["job_url"] + ")" if c.get("job_url") else "—"}
-"""
-    return md
+    return "\n".join(md)
+
 
 # 빨간색(Primary) 버튼
 if st.button("회사/직무 정보 불러오기", type="primary"):
