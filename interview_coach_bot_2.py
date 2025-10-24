@@ -421,10 +421,10 @@ except Exception as e:
 # ① 회사/직무 입력 (통합)
 # ==========================================================
 st.subheader("① 회사/직무 입력")
-company_name_input = st.text_input("회사 이름 (그대로 사용)", placeholder="예: 네이버 / Kakao / 삼성SDS")
-homepage_input     = st.text_input("공식 홈페이지 URL(선택)", placeholder="https://...")
+company_name_input = st.text_input("회사 이름", placeholder="예: 네이버 / Kakao / 삼성SDS")
 role_title         = st.text_input("지원 직무명", placeholder="데이터 애널리스트 / ML 엔지니어 ...")
 job_url_input      = st.text_input("채용 공고 URL(선택) — 없다면 자동 탐색")
+homepage_input     = st.text_input("공식 홈페이지 URL(선택)", placeholder="https://...")
 
 if "company_state" not in st.session_state:
     st.session_state.company_state = {}
