@@ -93,7 +93,7 @@ def fetch_bs4_text(url: str) -> Tuple[str, Optional[BeautifulSoup]]:
     for b in blocks:
         if b not in seen:
             seen.add(b); out.append(b)
-    return ("\n\n".join(out)[:120000], soup
+    return ("\n\n".join(out)[:120000], soup)
 
 def fetch_all_text(url: str):
     url = normalize_url(url)
