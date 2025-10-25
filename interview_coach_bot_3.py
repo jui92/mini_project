@@ -7,15 +7,27 @@ from bs4 import BeautifulSoup
 import html2text
 import streamlit as st
 
-# -----------------------------
-# Streamlit page
-# -----------------------------
-st.set_page_config(page_title="채용 공고 파서 (직접 URL → 구조화 요약)", page_icon="🧾", layout="wide")
-st.title("채용 공고 파서 · 직접 URL → 회사 요약/채용 요건")
+# ============== 기본 설정 ==============
+st.set_page_config(page_title="채용 공고 파서 + LLM 정제", page_icon="🧾", layout="wide")
+st.title("채용 공고 파서 · URL → 원문 수집 → LLM 정제 출력")
 
-# -----------------------------
-# HTTP helpers
-# -----------------------------
+# ============== OpenAI 준비 ==============
+try:
+    from openai import OpenAI
+except ImportError:
+    st.error("`openai` 패키지가 필요합니다. requirements.txt에 openai를 추가하세요.")
+    st.stop()
+
+API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
+if not API_KEY:
+    API_KEY = st.text_input("OPENAI_API_KEY 입력", type="password")
+if not API_KEY:
+    st.stop()
+client = OpenAI(api_key=API_KEY)
+
+CHAT_MODEL = st.sidebar.selectbox("LLM 모델", ["gpt-4o-mini","gpt-4o"], index=0)
+
+# ============== HTTP 유틸 ==============
 def normalize_url(u: str) -> Optional[str]:
     if not u: return None
     u = u.strip()
@@ -33,17 +45,14 @@ def http_get(url: str, timeout: int = 12) -> Optional[requests.Response]:
             },
             timeout=timeout,
         )
-        if r.status_code == 200 and "text/html" in r.headers.get("content-type", ""):
+        if r.status_code == 200 and "text/html" in r.headers.get("content-type",""):
             return r
     except Exception:
         pass
     return None
 
-# -----------------------------
-# Text extraction (Jina → WebBase → BS4)
-# -----------------------------
+# ============== 원문 수집 (Jina → Web → BS4) ==============
 def fetch_jina_text(url: str, timeout: int = 15) -> str:
-    """프리렌더 텍스트(더보기/동적 포함 가능)."""
     try:
         parts = urllib.parse.urlsplit(url)
         prox = f"https://r.jina.ai/http://{parts.netloc}{parts.path}"
@@ -71,141 +80,51 @@ def fetch_bs4_text(url: str) -> Tuple[str, Optional[BeautifulSoup]]:
     r = http_get(url, timeout=12)
     if not r: return "", None
     soup = BeautifulSoup(r.text, "lxml")
-
-    # 긴 블록 위주로
     blocks = []
-    for sel in ["article", "section", "main", "div", "ul", "ol"]:
+    for sel in ["article","section","main","div","ul","ol"]:
         for el in soup.select(sel):
             txt = el.get_text(" ", strip=True)
             if txt and len(txt) > 300:
-                txt = re.sub(r"\s+", " ", txt)
+                txt = re.sub(r"\s+"," ", txt)
                 blocks.append(txt)
     if not blocks:
-        all_txt = soup.get_text(" ", strip=True)
-        return all_txt[:120000], soup
-
+        return soup.get_text(" ", strip=True)[:120000], soup
     seen, out = set(), []
     for b in blocks:
         if b not in seen:
             seen.add(b); out.append(b)
     return ("\n\n".join(out)[:120000], soup)
 
-def fetch_all_text(url: str) -> Tuple[str, Dict, Optional[BeautifulSoup]]:
-    """최대치 텍스트와 디버그 메타, soup 반환"""
+def fetch_all_text(url: str):
     url = normalize_url(url)
-    if not url:
-        return "", {"error":"invalid_url"}, None
-
+    if not url: return "", {"error":"invalid_url"}, None
     jina = fetch_jina_text(url)
     if jina:
-        # soup는 별도로
         _, soup = fetch_bs4_text(url)
         return jina, {"source":"jina","len":len(jina),"url_final":url}, soup
-
-    webbase = fetch_webbase_text(url)
-    if webbase:
+    web = fetch_webbase_text(url)
+    if web:
         _, soup = fetch_bs4_text(url)
-        return webbase, {"source":"webbase","len":len(webbase),"url_final":url}, soup
-
+        return web, {"source":"webbase","len":len(web),"url_final":url}, soup
     bs, soup = fetch_bs4_text(url)
     return bs, {"source":"bs4","len":len(bs),"url_final":url}, soup
 
-# -----------------------------
-# Section parsing
-# -----------------------------
-H_ROLE = [r"모집\s*분야", r"채용\s*분야", r"Position", r"Role", r"직무\s*명", r"Job\s*Title"]
-H_RESP = [r"주요\s*업무", r"담당\s*업무", r"업무(?!\S)", r"Responsibilities?", r"What you will do"]
-H_QUAL = [r"자격\s*요건", r"지원\s*자격", r"필수\s*요건", r"Requirements?", r"Qualifications?"]
-H_PREF = [r"우대\s*사항", r"우대\s*조건", r"Preferred", r"Nice to have", r"Plus"]
-
-HEADER_PATTERNS = [
-    ("role", H_ROLE),
-    ("resp", H_RESP),
-    ("qual", H_QUAL),
-    ("pref", H_PREF),
-]
-
-BULLET_RX = re.compile(r"^\s*(?:[-*•·▪▶]|[0-9]+\.)\s+")
-
-def split_lines(text: str) -> List[str]:
-    lines = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines()]
-    return [l for l in lines if l]
-
-def pick_first(lines: List[str], patterns: List[str]) -> Optional[int]:
-    for i, ln in enumerate(lines):
-        s = ln.lower()
-        for pat in patterns:
-            if re.search(pat, s, re.I):
-                return i
-    return None
-
-def extract_sections_from_text(text: str) -> Dict[str, List[str]]:
-    """
-    텍스트에서 [role, resp, qual, pref] 구간을 찾아 불릿 리스트로 정리
-    """
-    lines = split_lines(text)
-    idx = {}
-    for key, pats in HEADER_PATTERNS:
-        pos = pick_first(lines, pats)
-        if pos is not None: idx[key] = pos
-
-    if not idx:
-        return {"role":[], "resp":[], "qual":[], "pref":[]}
-
-    # 섹션 경계 계산
-    order = sorted(idx.items(), key=lambda x: x[1])
-    bounds = []
-    for i, (k, start) in enumerate(order):
-        end = order[i+1][1] if i+1 < len(order) else len(lines)
-        bounds.append((k, start, end))
-
-    out = {"role":[], "resp":[], "qual":[], "pref":[]}
-    for k, s, e in bounds:
-        chunk = lines[s+1:e]   # 헤더 다음부터
-        bullets = []
-        cur = ""
-        for ln in chunk:
-            if BULLET_RX.match(ln):
-                if cur: bullets.append(cur.strip()); cur = ""
-                bullets.append(BULLET_RX.sub("", ln).strip())
-            else:
-                # 문장이 길면 이어붙이기
-                if cur:
-                    cur += " " + ln
-                else:
-                    cur = ln
-        if cur: bullets.append(cur.strip())
-
-        # 너무 짧은 라인은 제거
-        bullets = [b for b in bullets if len(b) > 3]
-        out[k] = bullets[:20]
-    return out
-
-def extract_company_meta(soup: Optional[BeautifulSoup]) -> Dict[str, str]:
-    meta = {"company_name":"", "company_intro": "", "job_title":""}
+# ============== 메타/섹션 보조 추출(LLM 힌트용) ==============
+def extract_company_meta(soup: Optional[BeautifulSoup]) -> Dict[str,str]:
+    meta = {"company_name":"","company_intro":"","job_title":""}
     if not soup: return meta
-
-    # 회사명 후보
-    # og:site_name, application-name, title 분리
     cand = []
     og = soup.find("meta", {"property":"og:site_name"})
     if og and og.get("content"): cand.append(og["content"])
     app = soup.find("meta", {"name":"application-name"})
     if app and app.get("content"): cand.append(app["content"])
     if soup.title and soup.title.string: cand.append(soup.title.string)
-
-    # 간단 정제
     cand = [re.split(r"[\-\|\·\—]", c)[0].strip() for c in cand if c]
     cand = [c for c in cand if 2 <= len(c) <= 40]
     meta["company_name"] = cand[0] if cand else ""
-
-    # 소개 = meta description 우선
     md = soup.find("meta", {"name":"description"}) or soup.find("meta", {"property":"og:description"})
     if md and md.get("content"):
-        intro = md["content"].strip()
-        meta["company_intro"] = re.sub(r"\s+", " ", intro)[:500]
-
-    # 직무명 후보: h1/h2/og:title
+        meta["company_intro"] = re.sub(r"\s+"," ", md["content"]).strip()[:500]
     jt = ""
     ogt = soup.find("meta", {"property":"og:title"})
     if ogt and ogt.get("content"): jt = ogt["content"]
@@ -215,104 +134,154 @@ def extract_company_meta(soup: Optional[BeautifulSoup]) -> Dict[str, str]:
     if not jt:
         h2 = soup.find("h2")
         if h2 and h2.get_text(): jt = h2.get_text(strip=True)
-
-    jt = re.sub(r"\s+", " ", jt).strip()
-    meta["job_title"] = jt[:120]
+    meta["job_title"] = re.sub(r"\s+"," ", jt).strip()[:120]
     return meta
 
-# -----------------------------
-# UI — Direct URL mode only
-# -----------------------------
-st.header("1) 채용 공고 URL 입력")
-url = st.text_input("채용 공고 상세 URL", placeholder="예: https://www.wanted.co.kr/wd/123456")
+# ============== LLM 정제 (핵심) ==============
+PROMPT_SYSTEM = (
+    "너는 채용 공고를 깔끔하게 구조화하는 보조원이다. "
+    "입력 텍스트는 포털 광고 문구, UI잔재, 복수 직무가 섞여 있을 수 있다. "
+    "한국어로 간결하고 중복없이 정제하라."
+)
 
-col_btn = st.columns(2)
-with col_btn[0]:
-    run = st.button("원문 가져오기", type="primary")
-with col_btn[1]:
-    show_raw = st.checkbox("원문 미리보기 표시", value=True)
+def llm_structurize(raw_text: str, meta_hint: Dict[str,str], model: str) -> Dict:
+    """
+    LLM이 정제된 구조 결과(JSON)를 반환.
+    반환 스키마:
+    {
+      "company_name": str,
+      "company_intro": str,   # 2~3문장 요약
+      "job_title": str,       # 대표 직무명 (여러 개일 경우 가장 중심 1개)
+      "responsibilities": [str],  # 3~8개 깔끔한 불릿
+      "qualifications": [str],    # 3~8개
+      "preferences": [str]        # 0~8개
+    }
+    """
+    # 컨텍스트 과다 방지: 9000자 제한
+    ctx = raw_text.strip()
+    if len(ctx) > 9000:
+        ctx = ctx[:9000]
+
+    user_msg = {
+        "role": "user",
+        "content": (
+            "다음 채용 공고 원문을 구조화해줘.\n\n"
+            f"[힌트] 회사명 후보: {meta_hint.get('company_name','')}\n"
+            f"[힌트] 직무명 후보: {meta_hint.get('job_title','')}\n"
+            "--- 원문 시작 ---\n"
+            f"{ctx}\n"
+            "--- 원문 끝 ---\n\n"
+            "JSON으로만 답하고, 키는 반드시 아래만 포함:\n"
+            "{"
+            "\"company_name\": str, "
+            "\"company_intro\": str, "
+            "\"job_title\": str, "
+            "\"responsibilities\": [str], "
+            "\"qualifications\": [str], "
+            "\"preferences\": [str]"
+            "}"
+        ),
+    }
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            messages=[{"role":"system","content":PROMPT_SYSTEM}, user_msg],
+        )
+        data = json.loads(resp.choices[0].message.content)
+        # 방어적 후처리
+        for k in ["responsibilities","qualifications","preferences"]:
+            if not isinstance(data.get(k, []), list):
+                data[k] = []
+            # 중복/공백 제거
+            clean = []
+            seen = set()
+            for it in data[k]:
+                t = re.sub(r"\s+"," ", str(it)).strip(" -•·").strip()
+                if t and t not in seen:
+                    seen.add(t); clean.append(t)
+            data[k] = clean[:12]
+        for k in ["company_name","company_intro","job_title"]:
+            if k in data and isinstance(data[k], str):
+                data[k] = re.sub(r"\s+"," ", data[k]).strip()
+        return data
+    except Exception as e:
+        # 실패 시 간단한 폴백
+        return {
+            "company_name": meta_hint.get("company_name",""),
+            "company_intro": meta_hint.get("company_intro","원문이 정제되지 않았습니다."),
+            "job_title": meta_hint.get("job_title",""),
+            "responsibilities": [],
+            "qualifications": [],
+            "preferences": [],
+            "error": str(e),
+        }
+
+# ============== UI ==============
+st.header("1) 채용 공고 URL")
+url = st.text_input("채용 공고 상세 URL", placeholder="예: https://www.wanted.co.kr/wd/123456")
+run = st.button("원문 수집 → LLM 정제", type="primary")
 
 if run:
     if not url.strip():
         st.warning("URL을 입력하세요.")
+        st.stop()
+
+    with st.spinner("원문 수집 중..."):
+        raw, meta, soup = fetch_all_text(url)
+        hint = extract_company_meta(soup)
+
+    with st.expander("디버그: 수집 메타/힌트", expanded=False):
+        st.json({"fetch_meta": meta, "meta_hint": hint})
+        st.write(f"원문 길이: {len(raw)}")
+
+    if not raw:
+        st.error("원문을 가져오지 못했습니다. (로그인/동적 렌더링/봇 차단 가능)")
+        st.stop()
+
+    with st.spinner("LLM으로 정제 중..."):
+        clean = llm_structurize(raw, hint, CHAT_MODEL)
+
+    st.header("2) 정제된 회사 요약 / 채용 요건")
+    st.markdown("### 회사명")
+    st.write(clean.get("company_name") or "N/A")
+
+    st.markdown("### 간단한 회사 소개(요약)")
+    st.write(clean.get("company_intro") or "N/A")
+
+    st.markdown("### 모집 분야(직무명)")
+    st.write(clean.get("job_title") or "N/A")
+
+    st.markdown("### 주요 업무")
+    resp = clean.get("responsibilities", [])
+    if resp:
+        for b in resp: st.markdown(f"- {b}")
     else:
-        with st.spinner("원문 수집 및 구조화 중..."):
-            text_all, meta, soup = fetch_all_text(url.strip())
-            company_meta = extract_company_meta(soup)
-            sections = extract_sections_from_text(text_all)
+        st.write("—")
 
-        # 디버그
-        with st.expander("디버그: 원문 수집 상태/메타"):
-            st.json({"fetch_meta": meta, "company_meta": company_meta})
-            st.write(f"원문 길이: {len(text_all)}")
+    st.markdown("### 자격 요건")
+    qual = clean.get("qualifications", [])
+    if qual:
+        for b in qual: st.markdown(f"- {b}")
+    else:
+        st.write("—")
 
-        # 레이아웃
-        st.header("2) 회사 요약 / 채용 요건 (구조화 출력)")
+    st.markdown("### 우대 사항")
+    pref = clean.get("preferences", [])
+    if pref:
+        for b in pref: st.markdown(f"- {b}")
+    else:
+        st.write("—")
 
-        st.markdown("### 회사명")
-        st.write(company_meta.get("company_name") or "N/A")
+    st.divider()
+    st.subheader("원문(간단 미리보기)")
+    st.text_area("원문 미리보기", value=raw[:3000], height=250)
+    st.download_button("원문 전체 다운로드", data=raw.encode("utf-8"),
+                       file_name="job_posting_raw.txt", mime="text/plain")
+    st.download_button("정제 결과(JSON) 다운로드",
+                       data=json.dumps(clean, ensure_ascii=False, indent=2).encode("utf-8"),
+                       file_name="job_posting_clean.json", mime="application/json")
 
-        st.markdown("### 간단한 회사 소개(요약)")
-        st.write(company_meta.get("company_intro") or "메타 설명을 찾지 못했습니다.")
-
-        st.markdown("### 모집 분야(직무명)")
-        job_title = company_meta.get("job_title") or (sections["role"][0] if sections["role"] else "")
-        st.write(job_title if job_title else "본문에서 직무명을 확정하지 못했습니다.")
-
-        st.markdown("### 주요 업무")
-        resp = sections.get("resp") or []
-        if resp:
-            for b in resp: st.markdown(f"- {b}")
-        else:
-            st.write("본문에서 '주요 업무' 섹션을 찾지 못했습니다.")
-
-        st.markdown("### 자격 요건")
-        qual = sections.get("qual") or []
-        if qual:
-            for b in qual: st.markdown(f"- {b}")
-        else:
-            st.write("본문에서 '자격 요건' 섹션을 찾지 못했습니다.")
-
-        st.markdown("### 우대 사항")
-        pref = sections.get("pref") or []
-        if pref:
-            for b in pref: st.markdown(f"- {b}")
-        else:
-            st.write("본문에서 '우대 사항' 섹션을 찾지 못했습니다.")
-
-        # 원문 보기/다운로드
-        if show_raw:
-            st.divider()
-            st.subheader("원문 텍스트(전체)")
-            st.text_area("원문", value=text_all[:30000], height=300)
-        st.download_button(
-            "원문 텍스트 다운로드",
-            data=text_all.encode("utf-8"),
-            file_name="job_posting_raw.txt",
-            mime="text/plain",
-        )
-
-        # JSON 결과 다운로드
-        result = {
-            "source_url": meta.get("url_final"),
-            "fetch_source": meta.get("source"),
-            "company_name": company_meta.get("company_name"),
-            "company_intro": company_meta.get("company_intro"),
-            "job_title": job_title,
-            "responsibilities": resp,
-            "qualifications": qual,
-            "preferences": pref,
-        }
-        st.download_button(
-            "구조화 결과(JSON) 다운로드",
-            data=json.dumps(result, ensure_ascii=False, indent=2).encode("utf-8"),
-            file_name="job_posting_structured.json",
-            mime="application/json",
-        )
-
-# 안내
-st.info(
-    "⚠️ 동적 렌더링/로그인/봇차단 페이지는 일부 누락될 수 있습니다.\n"
-    "- 우선순위: **Jina Reader → 정적 HTML → BS4**\n"
-    "- 섹션 헤더 키워드: 주요업무/담당업무, 자격요건/지원자격, 우대사항/Preferred 등을 기준으로 자동 분리합니다."
-)
+st.caption("팁) ‘상세 더보기’가 필요한 페이지는 Jina 프록시를 우선 사용하여 최대한 텍스트를 확보합니다.")
