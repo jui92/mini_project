@@ -5,12 +5,13 @@ import re # 글자 수 카운트를 위해 추가
 
 # LangChain 모듈 임포트
 from langchain_community.document_loaders import Docx2txtLoader, WebBaseLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_chroma import Chroma
+from langchain_community.vectorstores import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 from langchain_core.output_parsers import StrOutputParser
+
 
 # 환경 변수에서 OpenAI API 키 가져오기
 # LangChain_openai는 환경 변수 'OPENAI_API_KEY'를 자동으로 찾습니다.
