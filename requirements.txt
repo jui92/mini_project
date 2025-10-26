@@ -1,0 +1,12 @@
+streamlit
+langchain
+langchain-community
+langchain-openai
+langchain-chroma
+chromadb
+openai>=1.40
+html2text
+docx2txt
+beautifulsoup4
+lxml
+tiktoken
